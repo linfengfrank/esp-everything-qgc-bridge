@@ -1,0 +1,149 @@
+#pragma once
+
+#include <stdint.h>
+#include "vfh.h"
+
+/* ---------------------------------------------------------------------------
+ * FreeRTOS placement
+ * --------------------------------------------------------------------------- */
+#define WIFI_TASK_CORE      0
+#define WIFI_TASK_PRIORITY  2
+#define WIFI_TASK_STACK     12288
+
+/* Packet type bytes */
+#define WIFI_PKT_TELEM       0x01
+#define WIFI_PKT_CMD         0x02
+#define WIFI_PKT_TOF_DEBUG   0x03   /* debug: raw front-sensor 8×8 frame */
+
+/* Separate UDP port for ToF debug stream so it doesn't conflict with comms.py */
+#define WIFI_TOF_DEBUG_PORT  5007
+
+/* Pixels per sensor frame (8×8 grid) — duplicated here to avoid pulling in tof_task.h */
+#define WIFI_TOF_DEBUG_PIXELS  64
+
+/* Command port (drone listens for laptop commands on this UDP port) */
+#define WIFI_CMD_PORT        5006
+#define WIFI_MAX_FOUND_TAGS  12
+
+/* ---------------------------------------------------------------------------
+ * Telemetry packet — sent at 10 Hz over UDP to laptop.
+ * Packed so sizeof() gives the exact wire size.
+ * --------------------------------------------------------------------------- */
+typedef struct __attribute__((packed)) {
+    uint8_t  pkt_type;                      /* WIFI_PKT_TELEM                   */
+    uint8_t  drone_id;                      /* CONFIG_DRONE_ID                  */
+
+    float    ned_x;                         /* NED north (m)                    */
+    float    ned_y;                         /* NED east  (m)                    */
+    float    heading_rad;                   /* NED CW positive (rad)            */
+
+    uint8_t  nav_state;                     /* nav_state_t cast to uint8_t      */
+    int8_t   tag_id;                        /* last AprilTag ID, −1 if none     */
+    float    tag_dist_m;                    /* horizontal dist to tag (m)       */
+
+    uint8_t  vfh_blocked[VFH_BINS];         /* 1 = blocked, 0 = free            */
+    uint8_t  is_stuck;                      /* 1 = STUCK or RETREATING          */
+
+    uint16_t reloc_age_s;                   /* seconds since last nav-tag fix   */
+} wifi_telem_pkt_t;
+
+/* ---------------------------------------------------------------------------
+ * Command packet — received from laptop over UDP.
+ * --------------------------------------------------------------------------- */
+typedef struct __attribute__((packed)) {
+    uint8_t  pkt_type;                      /* WIFI_PKT_CMD                     */
+    uint8_t  cmd_type;                      /* CMD_GOTO / CMD_LAND / CMD_HOLD   */
+    float    goal_x;                        /* NED north (m)                    */
+    float    goal_y;                        /* NED east  (m)                    */
+    int8_t   found_tag_ids[WIFI_MAX_FOUND_TAGS]; /* −1 = unused slot           */
+} wifi_cmd_pkt_t;
+
+#define CMD_GOTO          0x01
+#define CMD_LAND          0x02
+#define CMD_HOLD          0x03
+#define CMD_SET_NAV_TAGS  0x04
+#define CMD_START         0x05   /* arm and take off */
+#define CMD_SET_PEERS     0x06   /* update nearby drone positions */
+
+/* ---------------------------------------------------------------------------
+ * Navigation-tag position packet — received from laptop over UDP.
+ * Tells the drone where known AprilTags are in the map frame so it can
+ * correct its odometry when it detects them.
+ * --------------------------------------------------------------------------- */
+#define WIFI_MAX_NAV_TAGS   16
+
+typedef struct __attribute__((packed)) {
+    int8_t   id;
+    float    odom_x;    /* NED north in drone odom frame (m) = map_x − start_x */
+    float    odom_y;    /* NED east  in drone odom frame (m) = map_y − start_y */
+} wifi_nav_tag_entry_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t  pkt_type;      /* WIFI_PKT_CMD                                         */
+    uint8_t  cmd_type;      /* CMD_SET_NAV_TAGS                                     */
+    uint8_t  tag_count;     /* number of valid entries (≤ WIFI_MAX_NAV_TAGS)        */
+    float    start_map_x;   /* this drone's start position in map frame (NED north) */
+    float    start_map_y;   /* this drone's start position in map frame (NED east)  */
+    wifi_nav_tag_entry_t tags[WIFI_MAX_NAV_TAGS];
+} wifi_nav_tags_pkt_t;
+
+/* ---------------------------------------------------------------------------
+ * Peer drone positions — received from laptop, used for inter-drone avoidance.
+ * Positions are in map frame; nav_task converts to odom for VFH injection.
+ * --------------------------------------------------------------------------- */
+#define WIFI_MAX_PEERS  7
+
+typedef struct {
+    float map_x;    /* NED north in map frame (m) */
+    float map_y;    /* NED east  in map frame (m) */
+} wifi_peer_t;
+
+typedef struct {
+    wifi_peer_t peers[WIFI_MAX_PEERS];
+    uint8_t     count;
+    uint32_t    update_ms;  /* esp_timer ms when last CMD_SET_PEERS arrived */
+} wifi_peer_list_t;
+
+/* Thread-safe snapshot of current peer positions. */
+wifi_peer_list_t wifi_get_peers(void);
+
+/* ---------------------------------------------------------------------------
+ * ToF debug packet — sent at 10 Hz to WIFI_TOF_DEBUG_PORT.
+ * Contains the raw 8×8 distance + status grid for the front sensor only.
+ * --------------------------------------------------------------------------- */
+typedef struct __attribute__((packed)) {
+    uint8_t  pkt_type;                              /* WIFI_PKT_TOF_DEBUG           */
+    uint8_t  sensor_idx;                            /* TOF_FRONT_SENSOR_IDX         */
+    uint8_t  sensor_ok;                             /* 1 if sensor initialised      */
+    uint32_t timestamp_ms;                          /* frame timestamp from sensor  */
+    uint16_t distance_mm[WIFI_TOF_DEBUG_PIXELS];    /* raw distances, 0 = invalid   */
+    uint8_t  target_status[WIFI_TOF_DEBUG_PIXELS];  /* 5 = valid, 9 = valid-weak    */
+} wifi_tof_debug_pkt_t;
+
+/* ---------------------------------------------------------------------------
+ * Lifecycle
+ * --------------------------------------------------------------------------- */
+
+/* Initialise WiFi station and block until IP is obtained.
+ * Call once in app_main before spawning wifi_task. */
+void wifi_task_init(void);
+
+/* FreeRTOS task entry — pin to Core 0, Priority 2.
+ *   xTaskCreatePinnedToCore(wifi_task, "wifi", WIFI_TASK_STACK,
+ *                           NULL, WIFI_TASK_PRIORITY, NULL, WIFI_TASK_CORE); */
+void wifi_task(void *arg);
+
+/* Returns true once the laptop has sent CMD_LAND. */
+bool wifi_land_requested(void);
+
+/* Clear the land-request flag (call after acting on it). */
+void wifi_clear_land_request(void);
+
+/* Returns true once the laptop has sent CMD_START. */
+bool wifi_start_requested(void);
+
+/* Clear the start-request flag (call after acting on it). */
+void wifi_clear_start_request(void);
+
+/* Returns true while the WiFi link is up (IP obtained, not disconnected). */
+bool wifi_is_connected(void);

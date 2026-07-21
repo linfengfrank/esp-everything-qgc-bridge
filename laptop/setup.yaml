@@ -1,0 +1,140 @@
+# Drone fleet configuration
+#
+# Map frame (NED):
+#   Origin: a fixed point in the arena (e.g. a corner or centre).
+#   X = North, Y = East, Z = Down.
+#   All positions below are in this frame.
+#
+# The map frame is anchored by navigation AprilTags at surveyed positions.
+# When a drone sees a nav tag, it corrects its PX4 odometry via
+# VISION_POSITION_ESTIMATE, making PX4's local NED converge to map frame.
+#
+# start_x / start_y: where each drone powers on in map frame (metres).
+# Used by the laptop for crumb transforms before the first vision fix.
+
+drones:
+  5:
+    start_x: -2.0
+    start_y: -4.0
+  11:
+    start_x: -2.0
+    start_y: -2.5
+  30:
+    start_x: -2.0
+    start_y: -1.0
+  7:
+    start_x: -2.0
+    start_y: 3.5
+  2:
+    start_x: -2.0
+    start_y: 5.0
+  12:
+    start_x: -2.0
+    start_y: 6.5
+  25:
+    start_x: -2.0
+    start_y: 11.0
+  19:
+    start_x: -2.0
+    start_y: 12.5
+  1:
+    start_x: -2.0
+    start_y: 14.0
+  # next row
+  26:
+    start_x: -4.0
+    start_y: -2.5
+  13:
+    start_x: -4.0
+    start_y: -1.0
+  24:
+    start_x: -4.0
+    start_y: 2.0
+  17:
+    start_x: -4.0
+    start_y: 3.5
+  23:
+    start_x: -4.0
+    start_y: 5.0
+  6:
+    start_x: -4.0
+    start_y: 6.5
+  27:
+    start_x: -4.0
+    start_y: 8.0
+  14:
+    start_x: -4.0
+    start_y: 11.0
+  
+
+# Arena bounds (map frame, metres).
+# Goals are clamped inside this rectangle.
+arena:
+  min_x: 0.0
+  max_x: 14.0
+  min_y: -5.0
+  max_y: 15.0
+
+# Stuck detection and recovery
+stuck:
+  progress_threshold_m: 0.5   # movement less than this = no progress
+  stuck_timeout_s:       10.0   # no progress for this long = stuck
+  stuck_zone_radius:     0.5   # radius of no-go zone marked at stuck location
+  stuck_zone_ttl_s:     60.0   # how long stuck zones persist
+  retreat_dist_m:        1.5   # fallback retreat distance when fully blocked
+
+# Navigation AprilTags at known map-frame positions.
+# These are sent to the drones at startup via CMD_SET_NAV_TAGS.
+# The drone uses them for odometry correction — NOT for landing.
+#
+# Key = AprilTag ID (tag16h5 family), value = map-frame position.
+# IDs 0–11 are reserved for landing targets — do NOT add them here.
+# Survey these positions carefully — odometry accuracy depends on it.
+nav_tags:
+  12: {map_x: 0.0, map_y: -3.5}
+  13: {map_x: 0.0, map_y: -1.5}
+  14: {map_x: 0.0, map_y: 5.0}
+  15: {map_x: 0.0, map_y: 11.5}
+  16: {map_x: 0.0, map_y: 13.5}
+  17: {map_x: 5.0, map_y: 0.0}
+  18: {map_x: 5.0, map_y: 10.0}
+  19: {map_x: 10.0, map_y: -1.0}
+  20: {map_x: 10.0, map_y: 5.0}
+  21: {map_x: 10.0, map_y: 11.0}
+  # 14: {map_x: 3.0, map_y: 3.0}
+  # 15: {map_x: 5.0, map_y: 3.0}
+  # 16: {map_x: 1.0, map_y: 6.0}
+  # 17: {map_x: 3.0, map_y: 6.0}
+  # 18: {map_x: 5.0, map_y: 6.0}
+# ---------------------------------------------------------------------------
+# Mission phase configuration (used by run_mission.py)
+# ---------------------------------------------------------------------------
+mission:
+  # Batch 1 — exploration & rescue drones (first simultaneous takeoff).
+  # Default: all drone IDs in `drones` section above.
+  # explore_ids: [5, 11, 30, 7, 2, 12, 25, 19, 1]
+  explore_ids: [6,7,14,17,19,24,26,27,30]
+
+  # Batch 2 — relay chain drones (second simultaneous takeoff).
+  # Leave empty to skip the relay phase entirely.
+  # relay_ids: [26, 13, 24, 17, 23, 6, 27, 14]
+  relay_ids: []
+
+  # Start-area anchor point (map frame) for the relay chain endpoint.
+  # One relay drone will land here; the chain extends to the bonus victim.
+  relay_start: [0.0, 5.0]
+
+  # AprilTag IDs placed at bonus victims.  When an exploration drone
+  # discovers one of these tags, its position becomes a relay target.
+  # Leave empty if unknown — any discovered tag can be selected manually.
+  bonus_tag_ids: [8, 9, 10, 11]
+
+  # Max distance between adjacent relay drones (rules require < 1.0 m).
+  relay_spacing_m: 0.9
+
+# Exploration parameters
+exploration:
+  goal_distance: 3.0       # project goal this far ahead (m)
+  cone_radius: 4.0         # crumb density query radius (m)
+  cone_half_angle_deg: 30  # half-width of density query cone (deg)
+  min_gap_bins: 2          # ignore gaps narrower than this
