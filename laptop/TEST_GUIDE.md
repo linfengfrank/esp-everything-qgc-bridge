@@ -112,7 +112,22 @@ Waiting for CMD_START from laptop...
 Telemetry -> 192.168.43.106:5005 | Commands <- port 5006
 ```
 
-## 5. Communication-only test
+## 5. Quick PX4-ESP32 link check
+
+Before running the mission script, run this connectivity check from the project
+root:
+
+```bash
+python laptop/check_px4_esp32_link.py
+```
+
+Or, if your terminal is already in `laptop/`:
+
+```bash
+python check_px4_esp32_link.py
+```
+
+## 6. Communication-only test
 
 Run:
 
@@ -152,12 +167,18 @@ CONFIG_HOST_IPV4_ADDR="192.168.43.106"
 If it does not match, update it through `idf.py menuconfig`, rebuild, and flash.
 Also allow Python through Windows Defender Firewall on private networks.
 
-## 6. Propellers-removed command test
+## 7. Propellers-removed command test
 
 With propellers removed, run:
 
 ```bash
 python simple_arm_takeoff_land.py --drone-id 2
+```
+
+Alternative command path using the simple goal script:
+
+```bash
+python simple_arm_set_goal.py --drone-id 2 --goal-x -2.0 --goal-y 5.0 --confirm
 ```
 
 The program waits for telemetry and asks:
@@ -195,7 +216,7 @@ Because the propellers are removed, this is only a communication and command
 acceptance test. Use the remote controller or PX4 safety procedures as needed
 to ensure the vehicle is disarmed before touching it.
 
-## 7. Supervised low-altitude flight test
+## 8. Supervised low-altitude flight test
 
 Conduct this only in an approved clear test area with appropriate supervision
 and a manual recovery method.
@@ -207,6 +228,17 @@ python simple_arm_takeoff_land.py \
   --drone-id 2 \
   --takeoff-wait 12 \
   --hover-time 5
+```
+
+Simple waypoint flight command:
+
+```bash
+python simple_waypoint_mission.py \
+  --drone-id 2 \
+  --waypoints-file waypoints_example.txt \
+  --takeoff-wait 5.0 \
+  --arrival-timeout 30.0 \
+  --confirm
 ```
 
 Sequence:
@@ -237,7 +269,7 @@ LAND command sent
 Disarmed — mission complete
 ```
 
-## 8. Emergency interruption
+## 9. Emergency interruption
 
 Pressing `Ctrl+C` after `CMD_START` makes the Python program attempt to send
 `CMD_LAND` before closing.
@@ -245,7 +277,7 @@ Pressing `Ctrl+C` after `CMD_START` makes the Python program attempt to send
 This is only a software fallback. Keep the supervised manual recovery method
 ready throughout the test.
 
-## 9. Repeating the test
+## 10. Repeating the test
 
 After landing, `mission_task` ends with:
 
