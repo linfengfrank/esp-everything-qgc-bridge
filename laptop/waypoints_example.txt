@@ -1,0 +1,5 @@
+# Example waypoint file for simple_waypoint_mission.py
+# Each line: x,y
+# NED frame: x=north, y=east
+0.5,0.0
+0.5,0.5
