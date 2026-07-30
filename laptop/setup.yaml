@@ -25,9 +25,12 @@ drones:
   7:
     start_x: -2.0
     start_y: 3.5
+  #2:
+  #  start_x: -2.0
+  #  start_y: 5.0
   2:
-    start_x: -2.0
-    start_y: 5.0
+    start_x: 0.0
+    start_y: 0.0
   12:
     start_x: -2.0
     start_y: 6.5

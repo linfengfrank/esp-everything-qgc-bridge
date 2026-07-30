@@ -230,6 +230,11 @@ python simple_arm_takeoff_land.py \
   --hover-time 5
 ```
 
+```bash
+python simple_arm_takeoff_land.py  --drone-id 2  --takeoff-wait 12  --hover-time 5
+```
+
+
 Simple waypoint flight command:
 
 ```bash
@@ -239,6 +244,14 @@ python simple_waypoint_mission.py \
   --takeoff-wait 5.0 \
   --arrival-timeout 30.0 \
   --confirm
+```
+
+```bash
+python simple_waypoint_mission.py --drone-id 2 --waypoints-file waypoints_example.txt --takeoff-wait 5.0  --arrival-timeout 30.0  --confirm
+```
+
+```bash
+python simple_waypoint_mission.py --drone-id 2 --waypoints-file waypoints_example.txt --takeoff-wait 5.0 --arrival-timeout 30.0 --confirm --live-telem
 ```
 
 Sequence:
