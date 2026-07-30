@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import signal
 import threading
 import time
@@ -58,10 +59,11 @@ class TelemetrySnapshot:
 
 
 class TelemetryTracker:
-    def __init__(self, drone_id: int) -> None:
+    def __init__(self, drone_id: int, print_live: bool = False) -> None:
         self.drone_id = drone_id
         self._snapshot = TelemetrySnapshot()
         self._condition = threading.Condition()
+        self._print_live = print_live
 
     def callback(self, packet: TelemetryPacket, source_ip: str) -> None:
         if packet.drone_id != self.drone_id:
@@ -74,6 +76,28 @@ class TelemetryTracker:
                 received_at=time.monotonic(),
             )
             self._condition.notify_all()
+
+            # Always show live position updates as soon as telemetry is received.
+            #log.info(
+            #    "Telemetry position: x=%.2f y=%.2f",
+            #    packet.ned_x,
+            #    packet.ned_y,
+            #)
+
+            if self._print_live:
+                tag_text = "none" if packet.tag_id < 0 else str(packet.tag_id)
+                log.info(
+                    "TELEM drone=%d pos=(%.2f, %.2f) heading=%.2f state=%s tag=%s dist=%.2f stuck=%s reloc=%ds",
+                    packet.drone_id,
+                    packet.ned_x,
+                    packet.ned_y,
+                    packet.heading_rad,
+                    packet.nav_state_name,
+                    tag_text,
+                    packet.tag_dist_m,
+                    "yes" if packet.is_stuck else "no",
+                    packet.reloc_age_s,
+                )
 
     def latest(self) -> TelemetrySnapshot:
         with self._condition:
@@ -120,7 +144,9 @@ def load_waypoints_from_file(path: str) -> list[tuple[float, float]]:
         raise FileNotFoundError(f"Waypoint file not found: {file_path}")
 
     waypoints: list[tuple[float, float]] = []
-    for line_number, raw_line in enumerate(file_path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_number, raw_line in enumerate(
+        file_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -197,15 +223,26 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to wait for each waypoint to be reached before continuing.",
     )
     parser.add_argument(
+        "--arrival-radius",
+        type=float,
+        default=0.25,
+        help="Horizontal distance threshold (meters) to accept a waypoint as reached (default: 0.35).",
+    )
+    parser.add_argument(
         "--finish-action",
         choices=["hold", "land"],
-        default="hold",
-        help="Action after final waypoint: hold current altitude/position or land (default: hold).",
+        default="land",
+        help="Action after final waypoint: hold current altitude/position or land (default: land).",
     )
     parser.add_argument(
         "--confirm",
         action="store_true",
         help="Require a confirmation prompt before sending any flight commands.",
+    )
+    parser.add_argument(
+        "--live-telem",
+        action="store_true",
+        help="Print each incoming telemetry update from the drone.",
     )
     return parser.parse_args()
 
@@ -217,26 +254,69 @@ def send_command(comms: CommsNode, drone_id: int, command_type: int, name: str) 
     log.info("%s sent to drone %d.", name, drone_id)
 
 
-def wait_for_arrival(tracker: TelemetryTracker, timeout_s: float) -> None:
+def wait_for_arrival(
+    tracker: TelemetryTracker,
+    timeout_s: float,
+    issued_after: float,
+    goal_x: float,
+    goal_y: float,
+    arrival_radius_m: float,
+) -> None:
     deadline = time.monotonic() + timeout_s
+    saw_fresh_telemetry = False
+    saw_non_arrived_state = False
+
     while time.monotonic() < deadline:
         snapshot = tracker.latest()
-        if snapshot.packet is not None and snapshot.packet.nav_state == NAV_ARRIVED:
+        packet = snapshot.packet
+
+        if packet is not None and snapshot.received_at > issued_after:
+            saw_fresh_telemetry = True
+            dist_to_goal = math.hypot(packet.ned_x - goal_x, packet.ned_y - goal_y)
+
             log.info(
-                "Waypoint reached at (%.2f, %.2f)",
-                snapshot.packet.ned_x,
-                snapshot.packet.ned_y,
+                "Current position: x=%.2f y=%.2f (goal x=%.2f y=%.2f, dist=%.2f m)",
+                packet.ned_x,
+                packet.ned_y,
+                goal_x,
+                goal_y,
+                dist_to_goal,
             )
-            return
+
+            if packet.nav_state != NAV_ARRIVED:
+                saw_non_arrived_state = True
+
+            # Require post-command telemetry so stale NAV_ARRIVED does not auto-pass.
+            if dist_to_goal <= arrival_radius_m or (
+                packet.nav_state == NAV_ARRIVED and saw_non_arrived_state
+            ):
+                log.info(
+                    "Waypoint reached at (%.2f, %.2f), goal=(%.2f, %.2f), dist=%.2f m",
+                    packet.ned_x,
+                    packet.ned_y,
+                    goal_x,
+                    goal_y,
+                    dist_to_goal,
+                )
+                return
+
         time.sleep(0.2)
 
     snapshot = tracker.latest()
     if snapshot.packet is not None:
+        dist_to_goal = math.hypot(
+            snapshot.packet.ned_x - goal_x,
+            snapshot.packet.ned_y - goal_y,
+        )
         log.warning(
-            "Waypoint arrival timeout; last nav_state=%s at (%.2f, %.2f)",
+            "Waypoint arrival timeout; fresh_telem=%s last nav_state=%s at (%.2f, %.2f), goal=(%.2f, %.2f), dist=%.2f m",
+            "yes" if saw_fresh_telemetry else "no",
             snapshot.packet.nav_state_name,
             snapshot.packet.ned_x,
             snapshot.packet.ned_y,
+            goal_x,
+            goal_y,
+            dist_to_goal,
         )
     else:
         log.warning("Waypoint arrival timeout; no telemetry received.")
@@ -245,8 +325,14 @@ def wait_for_arrival(tracker: TelemetryTracker, timeout_s: float) -> None:
 def main() -> int:
     args = parse_args()
 
-    if args.takeoff_wait < 0.0 or args.arrival_timeout <= 0.0:
-        raise SystemExit("Invalid timing values. Use non-negative takeoff wait and positive arrival timeout.")
+    if (
+        args.takeoff_wait < 0.0
+        or args.arrival_timeout <= 0.0
+        or args.arrival_radius <= 0.0
+    ):
+        raise SystemExit(
+            "Invalid timing values. Use non-negative takeoff wait, positive arrival timeout, and positive arrival radius."
+        )
 
     waypoints = list(args.waypoints)
     if args.waypoints_file:
@@ -255,7 +341,7 @@ def main() -> int:
     if not waypoints:
         raise SystemExit("No waypoints supplied. Use --waypoint values or --waypoints-file.")
 
-    tracker = TelemetryTracker(args.drone_id)
+    tracker = TelemetryTracker(args.drone_id, print_live=args.live_telem)
     comms = CommsNode(
         listen_port=args.telem_port,
         cmd_port=args.cmd_port,
@@ -295,11 +381,24 @@ def main() -> int:
                 goal_x,
                 goal_y,
             )
-            comms.send_command(
+            issued_after = time.monotonic()
+            sent_ok = comms.send_command(
                 args.drone_id,
                 CommandPacket(CMD_GOTO, goal_x=goal_x, goal_y=goal_y),
             )
-            wait_for_arrival(tracker, args.arrival_timeout)
+            if not sent_ok:
+                raise RuntimeError(
+                    f"Failed to send CMD_GOTO: drone {args.drone_id} IP is unknown."
+                )
+
+            wait_for_arrival(
+                tracker,
+                timeout_s=args.arrival_timeout,
+                issued_after=issued_after,
+                goal_x=goal_x,
+                goal_y=goal_y,
+                arrival_radius_m=args.arrival_radius,
+            )
             time.sleep(0.5)
 
         if args.finish_action == "land":
