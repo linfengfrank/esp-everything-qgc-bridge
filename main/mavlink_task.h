@@ -28,6 +28,10 @@
 #define MAV_TASK_PRIORITY   5
 #define MAV_TASK_STACK      6144
 
+// Hard cap for commanded translational speed from companion setpoints (m/s).
+// This is enforced in mavlink_set_velocity_* APIs before setpoints are sent.
+#define MAV_CMD_SPEED_CAP_MS 0.10f
+
 // ---------------------------------------------------------------------------
 // Telemetry readback — written by mavlink_task, read by mission_task
 // ---------------------------------------------------------------------------

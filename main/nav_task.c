@@ -127,6 +127,9 @@ static bool s_collision_active = false;
 
 static bool collision_avoid(float goal_z)
 {
+    (void)goal_z;
+    return false;
+
     if (!mavlink_position_valid()) return false;
     if (!tof_is_healthy()) return false;   /* stale sensors — let nav_tick hold */
 
@@ -263,132 +266,20 @@ static void nav_tick(const vfh_config_t *vfh_cfg)
         return;
     }
 
-    /* ---- Guard: hold position if ToF sensors are stale ---- */
-    if (!tof_is_healthy()) {
-        ESP_LOGW(TAG, "ToF sensors stale — holding position");
-        mavlink_set_position_ned(drone.x, drone.y, nav.goal_z, drone.heading);
-        return;
-    }
-
-    /* ---- VFH: stuck check + steering ----
-     *
-     * Call vfh_get_histogram once to get the free-bin count (stuck detection).
-     * If not stuck, call vfh_compute for the best steering direction.
-     * vfh_compute re-runs the histogram internally — acceptable at 10 Hz. */
-    tof_scan_collapsed_t scan = tof_get_collapsed_scan();
-
-    float hist[VFH_BINS];
-    bool  blocked[VFH_BINS];
-    vfh_get_histogram(&scan, vfh_cfg, hist, blocked);
-
-    /* Add soft repulsion from peer drones and re-threshold affected bins */
-    inject_peers_into_histogram(hist, drone.x, drone.y, drone.heading);
-    for (int b = 0; b < VFH_BINS; b++)
-        if (hist[b] >= vfh_cfg->density_threshold) blocked[b] = true;
-
-    int free_count = 0;
-    for (int b = 0; b < VFH_BINS; b++) if (!blocked[b]) free_count++;
+    bool blocked[VFH_BINS] = {false};
+    int free_count = VFH_BINS;
 
     /* ---- NED bearing to goal ----
      * atan2(East_delta, North_delta) gives NED bearing: 0=North, CW positive */
     float goal_ned_angle = atan2f(dy, dx);
 
-    /* Goal direction in body frame: 0=forward, CW positive */
-    float goal_body_angle = wrap_pi(goal_ned_angle - drone.heading);
-
     /* ---- Compute updated state ---- */
-    nav_state_t new_state       = nav.state;
-    float       new_steering    = nav.prev_steering_rad;
+    nav_state_t new_state       = NAV_FLYING;
+    float       new_steering    = 0.0f;
     uint32_t    new_stuck_count = nav.stuck_count;
 
-    if (nav.state == NAV_STUCK) {
-        /* Hold position — laptop stuck monitor will send a new goal */
-        mavlink_set_hold();
-
-    } else if (free_count == 0) {
-        /* All VFH bins blocked — hold and signal stuck to laptop */
-        mavlink_set_hold();
-        new_state       = NAV_STUCK;
-        new_stuck_count = nav.stuck_count + 1;
-        ESP_LOGW(TAG, "STUCK — all directions blocked (event #%lu)", (unsigned long)new_stuck_count);
-
-    } else {
-        /* Normal navigation */
-        float steering = vfh_compute(&scan, vfh_cfg, goal_body_angle,
-                                     nav.prev_steering_rad, blocked);
-        new_steering = steering;
-
-        /* |steering| is the heading error: how much we must rotate before flying.
-         *
-         * Strict "face forward" rule:
-         *   If misaligned → rotate in place, zero forward velocity.
-         *   If aligned    → fly forward at cruise speed, zero yaw.
-         *
-         * This ensures the front camera always faces the direction of travel. */
-        float heading_error = steering;
-
-        /* Desired NED heading = current heading + VFH body-frame steering.
-         * PX4's attitude controller rotates to this angle at its own rate —
-         * no gain tuning needed on our side. */
-        float desired_yaw = drone.heading + steering;
-
-        if (fabsf(heading_error) > NAV_YAW_TOL_RAD) {
-            /* ---- ROTATING: hold position, let PX4 rotate to desired_yaw ----
-             * Use position mode so PX4's position controller actively fights
-             * drift.  Velocity mode with vx=vy=0 only targets zero velocity
-             * and lets the drone drift freely. */
-            new_state = NAV_ROTATING;
-            mavlink_set_position_ned(drone.x, drone.y, nav.goal_z, desired_yaw);
-
-        } else {
-            /* ---- FLYING: aligned — fly forward at desired_yaw ----
-             * VFH re-evaluates every tick; if an obstacle causes |steering| to
-             * exceed NAV_YAW_TOL_RAD, the drone stops and re-aligns.
-             *
-             * Speed is scaled by the closest obstacle in the forward 90°
-             * arc so the drone decelerates smoothly before walls, giving
-             * ToF round-robin updates time to catch up. */
-            new_state = NAV_FLYING;
-
-            /* Find min range in ±45° arc around the current heading (0° body frame).
-             * Must use 0.0f here, NOT steering — the drone's momentum is forward
-             * regardless of where VFH is steering.  Using steering causes the ramp
-             * to miss a wall dead-ahead when VFH has already decided to turn. */
-            float min_fwd = 999.0f;
-            for (int i = 0; i < COLLISION_SCAN_PTS; i++) {
-                float bin_rad = (float)i * (2.0f * (float)M_PI / (float)COLLISION_SCAN_PTS);
-                float diff = wrap_pi(bin_rad);   /* diff from forward (0°) */
-                if (fabsf(diff) <= (float)M_PI / 4.0f && scan.ranges[i] < min_fwd) {
-                    min_fwd = scan.ranges[i];
-                }
-            }
-
-            /* Ramp speed: full cruise above 1.5 m, linearly down to 30%
-             * at COLLISION_DANGER_M, clamped so we never command < 30%. */
-#define SPEED_RAMP_FULL_M   1.5f
-#define SPEED_RAMP_MIN_FRAC 0.30f
-            float frac = 1.0f;
-            if (min_fwd < SPEED_RAMP_FULL_M) {
-                frac = SPEED_RAMP_MIN_FRAC
-                     + (1.0f - SPEED_RAMP_MIN_FRAC)
-                       * (min_fwd - COLLISION_DANGER_M)
-                       / (SPEED_RAMP_FULL_M - COLLISION_DANGER_M);
-                if (frac < SPEED_RAMP_MIN_FRAC) frac = SPEED_RAMP_MIN_FRAC;
-                if (frac > 1.0f) frac = 1.0f;
-            }
-
-            float speed = NAV_CRUISE_SPEED_MS * frac;
-            float vx = speed * cosf(desired_yaw);
-            float vy = speed * sinf(desired_yaw);
-            mavlink_set_velocity_xy_position_z(vx, vy, nav.goal_z, desired_yaw);
-        }
-
-        ESP_LOGD(TAG, "state=%d dist=%.2f err=%.1f° steer=%.1f° free=%d",
-                 new_state, dist,
-                 heading_error * 180.0f / (float)M_PI,
-                 steering      * 180.0f / (float)M_PI,
-                 free_count);
-    }
+    /* Direct waypoint mode: command the exact target each tick. */
+    mavlink_set_position_ned(goal_x, goal_y, nav.goal_z, goal_ned_angle);
 
     /* Write back under mutex */
     xSemaphoreTake(s_mutex, portMAX_DELAY);

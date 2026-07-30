@@ -86,6 +86,10 @@ static uint32_t s_bridge_last_log_ms      = 0;
 // ---------------------------------------------------------------------------
 #define PX4_CUSTOM_MAIN_MODE_OFFBOARD   6
 
+// Re-apply PX4 horizontal speed limit periodically so mode changes or
+// controller resets do not silently restore higher defaults.
+#define SPEED_LIMIT_REFRESH_MS           5000
+
 // ---------------------------------------------------------------------------
 // Internal setpoint state
 // ---------------------------------------------------------------------------
@@ -113,6 +117,25 @@ static uint32_t      s_sp_update_ms;   // timestamp of last setpoint update
 
 static SemaphoreHandle_t s_sp_mutex;
 static SemaphoreHandle_t s_state_mutex;
+
+static void clamp_vec2_to_speed(float *vx, float *vy, float max_speed)
+{
+    float mag = sqrtf((*vx) * (*vx) + (*vy) * (*vy));
+    if (mag <= max_speed || mag < 1e-6f) return;
+    float scale = max_speed / mag;
+    *vx *= scale;
+    *vy *= scale;
+}
+
+static void clamp_vec3_to_speed(float *vx, float *vy, float *vz, float max_speed)
+{
+    float mag = sqrtf((*vx) * (*vx) + (*vy) * (*vy) + (*vz) * (*vz));
+    if (mag <= max_speed || mag < 1e-6f) return;
+    float scale = max_speed / mag;
+    *vx *= scale;
+    *vy *= scale;
+    *vz *= scale;
+}
 
 // If no task updates the setpoint for this long, auto-switch to position hold.
 // Protects against nav_task crash leaving a stale velocity command.
@@ -404,6 +427,29 @@ static void send_land(void)
 }
 
 // ---------------------------------------------------------------------------
+// Command: clamp PX4 horizontal speed target
+// ---------------------------------------------------------------------------
+static void send_speed_limit(void)
+{
+    mavlink_message_t msg;
+    mavlink_msg_command_long_pack(
+        OBC_SYSID,
+        OBC_COMPID,
+        &msg,
+        PX4_SYSID,
+        PX4_COMPID,
+        MAV_CMD_DO_CHANGE_SPEED,
+        0,
+        1.0f,                  // param1: ground speed
+        MAV_CMD_SPEED_CAP_MS,  // param2: speed in m/s
+        -1.0f,                 // param3: no throttle change
+        0, 0, 0, 0
+    );
+    send_message(&msg);
+    ESP_LOGI(TAG, "Speed limit set: %.2f m/s", MAV_CMD_SPEED_CAP_MS);
+}
+
+// ---------------------------------------------------------------------------
 // Incoming message parser
 // Drains whatever is in the UART RX buffer and updates s_state.
 // ---------------------------------------------------------------------------
@@ -521,6 +567,8 @@ void mavlink_task_init(void)
 
 void mavlink_set_velocity_ned(float vx, float vy, float vz, float yaw_rate)
 {
+    clamp_vec3_to_speed(&vx, &vy, &vz, MAV_CMD_SPEED_CAP_MS);
+
     xSemaphoreTake(s_sp_mutex, portMAX_DELAY);
     s_sp.type     = SP_VELOCITY;
     s_sp.vx       = vx;
@@ -533,6 +581,8 @@ void mavlink_set_velocity_ned(float vx, float vy, float vz, float yaw_rate)
 
 void mavlink_set_velocity_xy_position_z(float vx, float vy, float z, float yaw)
 {
+    clamp_vec2_to_speed(&vx, &vy, MAV_CMD_SPEED_CAP_MS);
+
     xSemaphoreTake(s_sp_mutex, portMAX_DELAY);
     s_sp.type = SP_VEL_XY_POS_Z;
     s_sp.vx   = vx;
@@ -649,6 +699,10 @@ void mavlink_task(void *arg)
     // ---- Timing state ----
     TickType_t last_wake_tick = xTaskGetTickCount();
     uint32_t   last_hb_ms     = 0;
+    uint32_t   last_speed_ms  = 0;
+
+    // Send once at task start so PX4 gets a low-speed constraint early.
+    send_speed_limit();
 
     // ---- 20Hz loop ----
     while (1) {
@@ -662,6 +716,12 @@ void mavlink_task(void *arg)
         if (now_ms - last_hb_ms >= 1000) {
             send_heartbeat();
             last_hb_ms = now_ms;
+        }
+
+        // Re-apply speed limit as a guard against stack/mode resets.
+        if (now_ms - last_speed_ms >= SPEED_LIMIT_REFRESH_MS) {
+            send_speed_limit();
+            last_speed_ms = now_ms;
         }
 
         // 20 Hz: setpoint (MUST NOT be skipped — PX4 watchdog is 500ms)
