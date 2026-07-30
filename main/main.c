@@ -313,10 +313,7 @@ void app_main(void)
         nav_task, "nav", NAV_TASK_STACK,
         NULL, NAV_TASK_PRIORITY, NULL, NAV_TASK_CORE
     );
-    xTaskCreatePinnedToCore(
-        at_detect_task, "apriltag", AT_TASK_STACK,
-        NULL, AT_TASK_PRIORITY, NULL, AT_TASK_CORE
-    );
+    /* AprilTag task intentionally disabled for direct-waypoint test mode. */
     xTaskCreatePinnedToCore(
         mission_task, "mission", 6144,
         NULL, 2, NULL, 1
