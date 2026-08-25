@@ -343,6 +343,7 @@ void wifi_task(void *arg)
             dbg.pkt_type   = WIFI_PKT_AT_DEBUG;
             dbg.drone_id   = CONFIG_DRONE_ID;
             dbg.frame_ms   = live.frame_ms;
+            dbg.proc_ms    = live.proc_ms;
             dbg.latched_id = at_detect_my_tag_id();
             dbg.raw_count  = live.raw_count;
             dbg.count      = live.count;

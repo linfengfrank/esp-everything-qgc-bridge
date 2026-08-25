@@ -71,6 +71,7 @@ typedef struct {
 
 typedef struct {
     uint32_t      frame_ms;   /* esp_timer ms when this frame was processed */
+    uint16_t      proc_ms;    /* frame processing time (detect + pose), ms  */
     uint8_t       raw_count;  /* detections returned by the detector        */
     uint8_t       count;      /* entries stored in det[] (≤ AT_LIVE_MAX)    */
     at_live_det_t det[AT_LIVE_MAX];

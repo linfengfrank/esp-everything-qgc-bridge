@@ -72,14 +72,16 @@ static void mission_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     wifi_clear_start_request();
-    ESP_LOGI(TAG, "CMD_START received — checking ToF sensors...");
+    ESP_LOGI(TAG, "CMD_START received");
 
     /* ------------------------------------------------------------------ */
     /* Pre-arm safety: require all ToF sensors to be initialised.          */
     /* If any sensor failed, refuse to arm — flying without full obstacle  */
     /* coverage is too dangerous.  Log every 2 s so the issue is obvious.  */
     /* ------------------------------------------------------------------ */
+#if TOF_ENABLED
     {
+        ESP_LOGI(TAG, "Checking ToF sensors...");
         int tof_ok = tof_sensors_ok_count();
         while (tof_ok < TOF_SENSOR_COUNT) {
             ESP_LOGE(TAG, "TOF CHECK FAILED: %d / %d sensors OK — refusing to arm",
@@ -89,6 +91,9 @@ static void mission_task(void *arg)
         }
         ESP_LOGI(TAG, "All %d ToF sensors OK — proceeding to arm", tof_ok);
     }
+#else
+    ESP_LOGW(TAG, "ToF disabled (TOF_ENABLED=0) — skipping pre-arm sensor check");
+#endif
 
     /* ------------------------------------------------------------------ */
     /* Phase 3a: Switch to OFFBOARD mode                                   */
@@ -287,7 +292,7 @@ void app_main(void)
 
     /* Init all modules before spawning tasks */
     mavlink_task_init();
-    tof_task_init();
+    tof_task_init();    /* always: creates the scan mutex the tof_get_*() accessors take */
     nav_task_init();
     at_detect_init();
     odom_init();
@@ -298,10 +303,12 @@ void app_main(void)
         mavlink_task, "mav", MAV_TASK_STACK,
         NULL, MAV_TASK_PRIORITY, NULL, MAV_TASK_CORE
     );
+#if TOF_ENABLED
     xTaskCreatePinnedToCore(
         tof_task, "tof", TOF_TASK_STACK,
         NULL, TOF_TASK_PRIORITY, NULL, TOF_TASK_CORE
     );
+#endif
     xTaskCreatePinnedToCore(
         wifi_task, "wifi", WIFI_TASK_STACK,
         NULL, WIFI_TASK_PRIORITY, NULL, WIFI_TASK_CORE

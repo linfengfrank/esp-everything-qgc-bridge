@@ -145,11 +145,12 @@ typedef struct __attribute__((packed)) {
     uint8_t  pkt_type;      /* WIFI_PKT_AT_DEBUG                        */
     uint8_t  drone_id;      /* CONFIG_DRONE_ID                          */
     uint32_t frame_ms;      /* esp_timer ms of last processed frame     */
+    uint16_t proc_ms;       /* frame processing time (detect+pose), ms  */
     int8_t   latched_id;    /* mission tag claim, −1 = none (telemetry) */
     uint8_t  raw_count;     /* detections before the quality gate       */
     uint8_t  count;         /* det[] entries that follow                */
     wifi_at_det_t det[WIFI_AT_DEBUG_MAX];
-} wifi_at_debug_pkt_t;      /* 9-byte header + count × 30 bytes on wire */
+} wifi_at_debug_pkt_t;      /* 11-byte header + count × 30 bytes on wire */
 
 /* ---------------------------------------------------------------------------
  * Lifecycle

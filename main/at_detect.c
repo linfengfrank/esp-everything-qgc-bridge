@@ -181,7 +181,10 @@ static esp_err_t init_camera(void)
 }
 #endif
 
-#define LOOP_DELAY_MS 100
+/* Yield between frames so the idle task (watchdog feed) still runs.  Kept
+ * short: detection time dominates the loop period, and this delay adds
+ * directly to tag-detection latency. */
+#define LOOP_DELAY_MS 20
 
 static volatile bool  s_land_requested = false;
 static volatile int   s_last_tag_id = -1;
@@ -318,12 +321,15 @@ void at_detect_task(void* pvParams)
 
     // Tag detector configs
     // quad_sigma is Gaussian blur's sigma
-    // quad_decimate: small number = faster but cannot detect small tags
-    //                big number = slower but can detect small tags (or tag far away)
+    // quad_decimate: quad search runs on the image downscaled by this factor —
+    //                BIGGER = faster but far/small tags are lost
+    //                (payload decoding still runs at full resolution)
     // With quad_sigma = 1.0 and quad_decimate = 4.0, ESP32-CAM can detect 16h5 tag
     // from the distance of about 1 meter (tested with tag on screen. not on paper)
+    // 2.0 roughly halves per-frame latency vs 1.5 (watch the ms/frame figure in
+    // tag_debug.py); drop back to 1.5 if tags beyond ~1 m stop being detected.
     td->quad_sigma = 1.0;
-    td->quad_decimate = 1.5;//6.0;//5.0;
+    td->quad_decimate = 1.5;//1.5;//6.0;//5.0;
     td->refine_edges = 1;
     td->decode_sharpening = 0.75;
     td->nthreads = 1;
@@ -350,6 +356,8 @@ void at_detect_task(void* pvParams)
         // Testing responsiveness of camera
         // print_img(&at_im);
         // ESP_LOGI(TAG, "avg_img=%d", avg_img(&at_im));
+
+        uint32_t proc_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
         zarray_t *at_detections = apriltag_detector_detect(td, &at_im);
 
@@ -475,6 +483,8 @@ void at_detect_task(void* pvParams)
         /* Publish this frame's detections (count may be 0 — that means
          * "camera alive, no tag in view", which the debug UI relies on). */
         live.frame_ms  = (uint32_t)(esp_timer_get_time() / 1000);
+        uint32_t proc_ms = live.frame_ms - proc_start_ms;
+        live.proc_ms   = (proc_ms > 65535u) ? 65535u : (uint16_t)proc_ms;
         live.raw_count = (uint8_t)zarray_size(at_detections);
         xSemaphoreTake(s_live_mutex, portMAX_DELAY);
         s_live = live;

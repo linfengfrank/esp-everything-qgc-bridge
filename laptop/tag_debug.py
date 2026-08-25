@@ -35,6 +35,11 @@ show position/nav state from telemetry.  If a CommsNode script
 
 Requires the firmware from the same commit (adds the 5008 debug stream) —
 reflash the ESP32 if the panel says "waiting for AprilTag debug stream".
+
+Latency: the view lags reality by roughly the per-frame processing time shown
+in the header as "(NNN ms/frame)" plus <0.2 s of transport.  If it feels
+sluggish, raise quad_decimate in at_detect.c — bigger is faster, at the cost
+of losing far/small tags (the ms/frame figure shows the effect live).
 """
 
 import argparse
@@ -116,15 +121,19 @@ class DroneView:
         self.last_frame_ms       = None
         self.last_frame_change_t = 0.0
 
-    def update_at(self, pkt, now: float) -> None:
+    def update_at(self, pkt, now: float) -> bool:
+        """Returns True when the display should refresh immediately
+        (first packet from this drone, or a new detector frame)."""
         self.at        = pkt
         self.at_rx_t   = now
         self.at_count += 1
-        if pkt.frame_ms != self.last_frame_ms:
+        new_frame = pkt.frame_ms != self.last_frame_ms
+        if new_frame:
             self.last_frame_ms       = pkt.frame_ms
             self.last_frame_change_t = now
             if pkt.frame_ms != 0:
                 self.frame_times.append(now)
+        return new_frame or self.at_count == 1
 
     def update_telem(self, pkt, now: float) -> None:
         self.telem      = pkt
@@ -215,6 +224,11 @@ def render(views: dict, now: float, telem_ok: bool, good_only: bool,
         # -- drone header ----------------------------------------------------
         fps = v.detector_fps(now)
         fps_s = f"detector {fps:4.1f} fps" if fps else "detector   -- fps"
+        if v.at is not None and v.at.frame_ms != 0:
+            proc_s = f"{v.at.proc_ms:4d} ms"
+            if v.at.proc_ms > 400:
+                proc_s = C.paint(proc_s, C.YELLOW)
+            fps_s += f" ({proc_s}/frame)"
         link_s = (C.paint("link OK", C.GREEN) + f" ({age:4.1f}s)") if up else \
                  C.paint(f"LINK DOWN {age:5.1f}s", C.BOLD, C.RED)
         latched = v.at.latched_id if v.at else -1
@@ -398,12 +412,16 @@ def main() -> int:
     views: dict[int, DroneView] = {}
     t0 = time.monotonic()
 
+    dirty = False   # a new detector frame arrived → render without waiting
+
     def on_at(data: bytes) -> None:
+        nonlocal dirty
         pkt = parse_at_debug(data)
         if pkt is None or args.drone_id not in (None, pkt.drone_id):
             return
-        views.setdefault(pkt.drone_id,
-                         DroneView(pkt.drone_id)).update_at(pkt, time.monotonic())
+        view = views.setdefault(pkt.drone_id, DroneView(pkt.drone_id))
+        if view.update_at(pkt, time.monotonic()):
+            dirty = True
 
     def on_telem(data: bytes) -> None:
         pkt = parse_telemetry(data)
@@ -434,7 +452,10 @@ def main() -> int:
 
             now = time.monotonic()
             if use_ui:
-                if now - last_render >= 0.1:
+                # Render immediately on a fresh detector frame; otherwise tick
+                # at 10 Hz to keep ages/clock moving.
+                if dirty or now - last_render >= 0.1:
+                    dirty = False
                     last_render = now
                     frame = render(views, now, telem_sock is not None,
                                    args.good_only, nav_ids)

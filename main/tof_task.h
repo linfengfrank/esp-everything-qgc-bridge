@@ -7,6 +7,13 @@
 // ---------------------------------------------------------------------------
 // Hardware config
 // ---------------------------------------------------------------------------
+// Set to 0 when the ToF ring / TCA9548A mux is not fitted.  Skips the tof_task
+// spawn (and its endless I2C init retries) plus the pre-arm sensor check.
+// nav_task runs in direct-waypoint mode and does not consume ToF data, so 0 is
+// safe for waypoint testing.  tof_task_init() still runs either way so the
+// tof_get_*() accessors used by wifi_task stay valid (they return zeros).
+#define TOF_ENABLED             0
+
 #define TOF_SENSOR_COUNT        8
 #define TOF_SENSOR_RESO         8
 #define TOF_I2C_PORT            I2C_NUM_0

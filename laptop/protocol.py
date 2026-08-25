@@ -113,9 +113,9 @@ def parse_telemetry(data: bytes) -> Optional[TelemetryPacket]:
 # frame — tags appear and disappear in real time.
 # ---------------------------------------------------------------------------
 
-# Header: pkt_type, drone_id, frame_ms, latched_id, raw_count, count
-_AT_DEBUG_HDR_FMT  = "<BBIbBB"
-_AT_DEBUG_HDR_SIZE = struct.calcsize(_AT_DEBUG_HDR_FMT)   # 9 bytes
+# Header: pkt_type, drone_id, frame_ms, proc_ms, latched_id, raw_count, count
+_AT_DEBUG_HDR_FMT  = "<BBIHbBB"
+_AT_DEBUG_HDR_SIZE = struct.calcsize(_AT_DEBUG_HDR_FMT)   # 11 bytes
 
 # Per detection: id, hamming, margin, cx, cy, tx, ty, tz, pose_err
 _AT_DET_FMT  = "<bB7f"
@@ -150,6 +150,7 @@ class TagDetection:
 class AtDebugPacket:
     drone_id:   int
     frame_ms:   int    # esp_timer ms when the frame was processed (0 = none yet)
+    proc_ms:    int    # frame processing time (detect + pose) in ms
     latched_id: int    # mission tag claim (telemetry tag_id), −1 = none
     raw_count:  int    # detections in frame before quality filtering
     detections: list   # of TagDetection (may be truncated to 8 by firmware)
@@ -160,7 +161,7 @@ def parse_at_debug(data: bytes) -> Optional[AtDebugPacket]:
     if len(data) < _AT_DEBUG_HDR_SIZE:
         return None
 
-    (pkt_type, drone_id, frame_ms,
+    (pkt_type, drone_id, frame_ms, proc_ms,
      latched_id, raw_count, count) = struct.unpack_from(_AT_DEBUG_HDR_FMT, data, 0)
 
     if pkt_type != PKT_AT_DEBUG:
@@ -177,6 +178,7 @@ def parse_at_debug(data: bytes) -> Optional[AtDebugPacket]:
     return AtDebugPacket(
         drone_id   = drone_id,
         frame_ms   = frame_ms,
+        proc_ms    = proc_ms,
         latched_id = latched_id,
         raw_count  = raw_count,
         detections = detections,
