@@ -34,11 +34,22 @@
 static at_detect_pose_t  s_pose;
 static SemaphoreHandle_t s_pose_mutex;
 
+static at_live_dets_t    s_live;
+static SemaphoreHandle_t s_live_mutex;
+
 at_detect_pose_t at_detect_get_pose(void)
 {
     xSemaphoreTake(s_pose_mutex, portMAX_DELAY);
     at_detect_pose_t copy = s_pose;
     xSemaphoreGive(s_pose_mutex);
+    return copy;
+}
+
+at_live_dets_t at_detect_get_live(void)
+{
+    xSemaphoreTake(s_live_mutex, portMAX_DELAY);
+    at_live_dets_t copy = s_live;
+    xSemaphoreGive(s_live_mutex);
     return copy;
 }
 /* Camera is pitched 45° nose-down, 2 cm forward of drone centre.
@@ -170,7 +181,10 @@ static esp_err_t init_camera(void)
 }
 #endif
 
-#define LOOP_DELAY_MS 100
+/* Yield between frames so the idle task (watchdog feed) still runs.  Kept
+ * short: detection time dominates the loop period, and this delay adds
+ * directly to tag-detection latency. */
+#define LOOP_DELAY_MS 20
 
 static volatile bool  s_land_requested = false;
 static volatile int   s_last_tag_id = -1;
@@ -199,10 +213,13 @@ void at_detect_init(void)
     s_my_tag_id      = -1;
     s_known_count    = 0;
     memset(&s_pose, 0, sizeof(s_pose));
+    memset(&s_live, 0, sizeof(s_live));
     s_pose_mutex  = xSemaphoreCreateMutex();
     s_known_mutex = xSemaphoreCreateMutex();
+    s_live_mutex  = xSemaphoreCreateMutex();
     configASSERT(s_pose_mutex != NULL);
     configASSERT(s_known_mutex != NULL);
+    configASSERT(s_live_mutex != NULL);
 }
 
 bool at_detect_land_requested(void)
@@ -304,12 +321,15 @@ void at_detect_task(void* pvParams)
 
     // Tag detector configs
     // quad_sigma is Gaussian blur's sigma
-    // quad_decimate: small number = faster but cannot detect small tags
-    //                big number = slower but can detect small tags (or tag far away)
+    // quad_decimate: quad search runs on the image downscaled by this factor —
+    //                BIGGER = faster but far/small tags are lost
+    //                (payload decoding still runs at full resolution)
     // With quad_sigma = 1.0 and quad_decimate = 4.0, ESP32-CAM can detect 16h5 tag
     // from the distance of about 1 meter (tested with tag on screen. not on paper)
+    // 2.0 roughly halves per-frame latency vs 1.5 (watch the ms/frame figure in
+    // tag_debug.py); drop back to 1.5 if tags beyond ~1 m stop being detected.
     td->quad_sigma = 1.0;
-    td->quad_decimate = 1.5;//6.0;//5.0;
+    td->quad_decimate = 1.5;//1.5;//6.0;//5.0;
     td->refine_edges = 1;
     td->decode_sharpening = 0.75;
     td->nthreads = 1;
@@ -337,11 +357,44 @@ void at_detect_task(void* pvParams)
         // print_img(&at_im);
         // ESP_LOGI(TAG, "avg_img=%d", avg_img(&at_im));
 
+        uint32_t proc_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
         zarray_t *at_detections = apriltag_detector_detect(td, &at_im);
+
+        at_live_dets_t live = {0};
 
         for (int i = 0; i < zarray_size(at_detections); i++) {
           apriltag_detection_t *det;
           zarray_get(at_detections, i, &det);
+
+          /* Record every raw detection for the live debug stream, before
+           * the nav-tag / known-tag / latch filters below drop it.  Pose is
+           * only computed for detections passing the same quality gate the
+           * filters use, so pose_err < 0 marks a gate-rejected detection. */
+          if (live.count < AT_LIVE_MAX) {
+              at_live_det_t *ld = &live.det[live.count++];
+              ld->id       = (int8_t)det->id;
+              ld->hamming  = (uint8_t)det->hamming;
+              ld->margin   = det->decision_margin;
+              ld->cx       = (float)det->c[0];
+              ld->cy       = (float)det->c[1];
+              ld->pose_err = -1.0f;
+              if (det->hamming <= 1 && det->decision_margin > 55.0) {
+                  apriltag_detection_info_t live_info = {
+                      .det     = det,
+                      .tagsize = TAG_SIZE,
+                      .fx = F_X, .fy = F_Y,
+                      .cx = C_X, .cy = C_Y,
+                  };
+                  apriltag_pose_t live_pose;
+                  ld->pose_err = (float)estimate_tag_pose(&live_info, &live_pose);
+                  ld->tx = (float)MATD_EL(live_pose.t, 0, 0);
+                  ld->ty = (float)MATD_EL(live_pose.t, 1, 0);
+                  ld->tz = (float)MATD_EL(live_pose.t, 2, 0);
+                  matd_destroy(live_pose.R);
+                  matd_destroy(live_pose.t);
+              }
+          }
 
           if (det->hamming > 1 || det->decision_margin <= 55.0) continue;
 
@@ -426,6 +479,17 @@ void at_detect_task(void* pvParams)
           matd_destroy(pose.t);
 
         }
+
+        /* Publish this frame's detections (count may be 0 — that means
+         * "camera alive, no tag in view", which the debug UI relies on). */
+        live.frame_ms  = (uint32_t)(esp_timer_get_time() / 1000);
+        uint32_t proc_ms = live.frame_ms - proc_start_ms;
+        live.proc_ms   = (proc_ms > 65535u) ? 65535u : (uint16_t)proc_ms;
+        live.raw_count = (uint8_t)zarray_size(at_detections);
+        xSemaphoreTake(s_live_mutex, portMAX_DELAY);
+        s_live = live;
+        xSemaphoreGive(s_live_mutex);
+
         ESP_LOGI(TAG, "%d Apriltags Found!", zarray_size(at_detections));
 
         // cleanup

@@ -8,6 +8,7 @@ Command (laptop → ESP32, event-driven):
     Fixed 18-byte packet.
 """
 
+import math
 import struct
 from dataclasses import dataclass, field
 from typing import Optional
@@ -16,8 +17,11 @@ from typing import Optional
 # Constants
 # ---------------------------------------------------------------------------
 
-PKT_TELEM   = 0x01   # telemetry from drone
-PKT_CMD     = 0x02   # command to drone
+PKT_TELEM     = 0x01   # telemetry from drone
+PKT_CMD       = 0x02   # command to drone
+PKT_AT_DEBUG  = 0x04   # live AprilTag detections (debug stream)
+
+AT_DEBUG_PORT = 5008   # UDP port the AprilTag debug stream arrives on
 
 CMD_GOTO          = 0x01   # navigate to (goal_x, goal_y)
 CMD_LAND          = 0x02   # land immediately
@@ -99,6 +103,85 @@ def parse_telemetry(data: bytes) -> Optional[TelemetryPacket]:
         vfh_blocked = vfh_blocked,
         is_stuck    = bool(is_stuck),
         reloc_age_s = reloc_age_s,
+    )
+
+# ---------------------------------------------------------------------------
+# AprilTag debug packet  (drone → laptop, UDP port AT_DEBUG_PORT, 10 Hz)
+#
+# Unlike the tag_id field in telemetry (a latched mission claim that never
+# clears), this stream reports every raw detection in the most recent camera
+# frame — tags appear and disappear in real time.
+# ---------------------------------------------------------------------------
+
+# Header: pkt_type, drone_id, frame_ms, proc_ms, latched_id, raw_count, count
+_AT_DEBUG_HDR_FMT  = "<BBIHbBB"
+_AT_DEBUG_HDR_SIZE = struct.calcsize(_AT_DEBUG_HDR_FMT)   # 11 bytes
+
+# Per detection: id, hamming, margin, cx, cy, tx, ty, tz, pose_err
+_AT_DET_FMT  = "<bB7f"
+_AT_DET_SIZE = struct.calcsize(_AT_DET_FMT)               # 30 bytes
+
+
+@dataclass
+class TagDetection:
+    id:       int     # tag ID (tag16h5)
+    hamming:  int     # corrected bit errors
+    margin:   float   # decision margin — higher = more confident
+    cx:       float   # tag centre in image pixels
+    cy:       float
+    tx:       float   # camera-frame translation (m): X=right, Y=down, Z=forward
+    ty:       float
+    tz:       float
+    pose_err: float   # pose reprojection error; < 0 = pose not computed
+
+    @property
+    def has_pose(self) -> bool:
+        """True if this detection passed the firmware quality gate
+        (hamming ≤ 1 and margin > 55) and carries a pose estimate."""
+        return self.pose_err >= 0.0
+
+    @property
+    def range_m(self) -> float:
+        """Straight-line camera-to-tag distance (m)."""
+        return math.sqrt(self.tx**2 + self.ty**2 + self.tz**2)
+
+
+@dataclass
+class AtDebugPacket:
+    drone_id:   int
+    frame_ms:   int    # esp_timer ms when the frame was processed (0 = none yet)
+    proc_ms:    int    # frame processing time (detect + pose) in ms
+    latched_id: int    # mission tag claim (telemetry tag_id), −1 = none
+    raw_count:  int    # detections in frame before quality filtering
+    detections: list   # of TagDetection (may be truncated to 8 by firmware)
+
+
+def parse_at_debug(data: bytes) -> Optional[AtDebugPacket]:
+    """Parse a raw UDP payload into an AtDebugPacket. Returns None on error."""
+    if len(data) < _AT_DEBUG_HDR_SIZE:
+        return None
+
+    (pkt_type, drone_id, frame_ms, proc_ms,
+     latched_id, raw_count, count) = struct.unpack_from(_AT_DEBUG_HDR_FMT, data, 0)
+
+    if pkt_type != PKT_AT_DEBUG:
+        return None
+
+    detections = []
+    offset = _AT_DEBUG_HDR_SIZE
+    for _ in range(count):
+        if offset + _AT_DET_SIZE > len(data):
+            break
+        detections.append(TagDetection(*struct.unpack_from(_AT_DET_FMT, data, offset)))
+        offset += _AT_DET_SIZE
+
+    return AtDebugPacket(
+        drone_id   = drone_id,
+        frame_ms   = frame_ms,
+        proc_ms    = proc_ms,
+        latched_id = latched_id,
+        raw_count  = raw_count,
+        detections = detections,
     )
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,13 @@
+# Nav-tag odom-correction test route (map frame: x=north, y=east)
+# Setup: tag 13 physically at map (0.0, -1.5), top edge facing NORTH.
+#        Drone 2 takes off from map (0, 0).
+# Leg 1 flies west toward the tag; the 45-deg camera picks it up in the
+# last ~0.5 m and holds it centered while hovering at (0, -1.0).
+0.0 -1.0
+# Return to start — with the corrected frame; verifies waypoints still land true.
+0.0 0.0
+# Original zig-zag route.
+0.5 0.2
+1.0 0.0
+1.5 0.3
+2.0 0.0

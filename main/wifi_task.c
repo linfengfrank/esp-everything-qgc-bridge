@@ -84,6 +84,15 @@ void wifi_task_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* Disable modem sleep.  The default WIFI_PS_MIN_MODEM powers the PHY down
+     * between DTIM beacons and re-runs esp_phy_enable() on every wake, which
+     * allocates from internal DRAM.  With the camera + AprilTag detector
+     * running, internal RAM is tight enough that this allocation fails and
+     * ESP_ERROR_CHECK inside phy_track_pll_init() aborts the whole system.
+     * Keeping the PHY on also cuts telemetry/command latency. */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
     esp_wifi_connect();
 
     ESP_LOGI(TAG, "Connecting to '%s'...", CONFIG_WIFI_SSID);
@@ -231,6 +240,16 @@ void wifi_task(void *arg)
     inet_aton(CONFIG_HOST_IPV4_ADDR, &tof_dest.sin_addr);
     connect(tof_sock, (struct sockaddr *)&tof_dest, sizeof(tof_dest));
 
+    /* AprilTag debug send socket */
+    int at_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    configASSERT(at_sock >= 0);
+    struct sockaddr_in at_dest = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(WIFI_AT_DEBUG_PORT),
+    };
+    inet_aton(CONFIG_HOST_IPV4_ADDR, &at_dest.sin_addr);
+    connect(at_sock, (struct sockaddr *)&at_dest, sizeof(at_dest));
+
     /* Command receive socket (non-blocking) */
     int rx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     configASSERT(rx_sock >= 0);
@@ -313,6 +332,35 @@ void wifi_task(void *arg)
             memcpy(dbg.target_status, scan.frame[TOF_FRONT_SENSOR_IDX].target_status,
                    sizeof(dbg.target_status));
             send(tof_sock, &dbg, sizeof(dbg), 0);
+        }
+
+        /* ---- Send live AprilTag detections (most recent camera frame) ---- */
+        {
+            _Static_assert(AT_LIVE_MAX == WIFI_AT_DEBUG_MAX,
+                           "AT debug wire format out of sync with at_detect");
+            at_live_dets_t live = at_detect_get_live();
+            wifi_at_debug_pkt_t dbg = {};
+            dbg.pkt_type   = WIFI_PKT_AT_DEBUG;
+            dbg.drone_id   = CONFIG_DRONE_ID;
+            dbg.frame_ms   = live.frame_ms;
+            dbg.proc_ms    = live.proc_ms;
+            dbg.latched_id = at_detect_my_tag_id();
+            dbg.raw_count  = live.raw_count;
+            dbg.count      = live.count;
+            for (int i = 0; i < live.count; i++) {
+                dbg.det[i].id       = live.det[i].id;
+                dbg.det[i].hamming  = live.det[i].hamming;
+                dbg.det[i].margin   = live.det[i].margin;
+                dbg.det[i].cx       = live.det[i].cx;
+                dbg.det[i].cy       = live.det[i].cy;
+                dbg.det[i].tx       = live.det[i].tx;
+                dbg.det[i].ty       = live.det[i].ty;
+                dbg.det[i].tz       = live.det[i].tz;
+                dbg.det[i].pose_err = live.det[i].pose_err;
+            }
+            size_t wire_len = sizeof(dbg)
+                - (size_t)(WIFI_AT_DEBUG_MAX - dbg.count) * sizeof(wifi_at_det_t);
+            send(at_sock, &dbg, wire_len, 0);
         }
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(100));   /* 10 Hz */

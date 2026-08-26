@@ -438,7 +438,7 @@ void tof_task(void *arg)
         uint8_t is_ready = 0;
         uint8_t status = vl53l5cx_check_data_ready(&s_dev, &is_ready);
         if (status) {
-            ESP_LOGW(TAG, "[%d] check_data_ready status=%d", sensor, status);
+            ESP_LOGD(TAG, "[%d] check_data_ready status=%d", sensor, status);
             consecutive_fails++;
             vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(8));
             continue;
@@ -450,7 +450,7 @@ void tof_task(void *arg)
         if (is_ready) {
             status = vl53l5cx_get_ranging_data(&s_dev, &results);
             if (status) {
-                ESP_LOGW(TAG, "[%d] get_ranging_data status=%d", sensor, status);
+                ESP_LOGD(TAG, "[%d] get_ranging_data status=%d", sensor, status);
             } else {
                 uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 

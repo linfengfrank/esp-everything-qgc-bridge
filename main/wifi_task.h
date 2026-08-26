@@ -14,9 +14,13 @@
 #define WIFI_PKT_TELEM       0x01
 #define WIFI_PKT_CMD         0x02
 #define WIFI_PKT_TOF_DEBUG   0x03   /* debug: raw front-sensor 8×8 frame */
+#define WIFI_PKT_AT_DEBUG    0x04   /* debug: live AprilTag detections   */
 
 /* Separate UDP port for ToF debug stream so it doesn't conflict with comms.py */
 #define WIFI_TOF_DEBUG_PORT  5007
+
+/* Separate UDP port for the live AprilTag debug stream (tag_debug.py) */
+#define WIFI_AT_DEBUG_PORT   5008
 
 /* Pixels per sensor frame (8×8 grid) — duplicated here to avoid pulling in tof_task.h */
 #define WIFI_TOF_DEBUG_PIXELS  64
@@ -119,6 +123,34 @@ typedef struct __attribute__((packed)) {
     uint16_t distance_mm[WIFI_TOF_DEBUG_PIXELS];    /* raw distances, 0 = invalid   */
     uint8_t  target_status[WIFI_TOF_DEBUG_PIXELS];  /* 5 = valid, 9 = valid-weak    */
 } wifi_tof_debug_pkt_t;
+
+/* ---------------------------------------------------------------------------
+ * AprilTag debug packet — sent at 10 Hz to WIFI_AT_DEBUG_PORT.
+ * Carries every raw detection from the most recent camera frame, so the
+ * laptop sees tags in real time (unlike the latched tag_id in telemetry).
+ * Only the first `count` det[] entries are sent on the wire.
+ * --------------------------------------------------------------------------- */
+#define WIFI_AT_DEBUG_MAX   8   /* must match AT_LIVE_MAX in at_detect.h */
+
+typedef struct __attribute__((packed)) {
+    int8_t  id;         /* tag ID                                       */
+    uint8_t hamming;    /* corrected bit errors                         */
+    float   margin;     /* decision margin (higher = more confident)    */
+    float   cx, cy;     /* tag centre in image pixels                   */
+    float   tx, ty, tz; /* camera-frame translation (m)                 */
+    float   pose_err;   /* pose reprojection error; < 0 = no pose       */
+} wifi_at_det_t;        /* 30 bytes */
+
+typedef struct __attribute__((packed)) {
+    uint8_t  pkt_type;      /* WIFI_PKT_AT_DEBUG                        */
+    uint8_t  drone_id;      /* CONFIG_DRONE_ID                          */
+    uint32_t frame_ms;      /* esp_timer ms of last processed frame     */
+    uint16_t proc_ms;       /* frame processing time (detect+pose), ms  */
+    int8_t   latched_id;    /* mission tag claim, −1 = none (telemetry) */
+    uint8_t  raw_count;     /* detections before the quality gate       */
+    uint8_t  count;         /* det[] entries that follow                */
+    wifi_at_det_t det[WIFI_AT_DEBUG_MAX];
+} wifi_at_debug_pkt_t;      /* 11-byte header + count × 30 bytes on wire */
 
 /* ---------------------------------------------------------------------------
  * Lifecycle

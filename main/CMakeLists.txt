@@ -12,7 +12,9 @@ idf_component_register(
     REQUIRES
         mavlink
         vl53l5cx
-        driver
+        esp_driver_i2c
+        esp_driver_uart
+        esp_driver_gpio
         freertos
         esp_timer
         esp-apriltag
