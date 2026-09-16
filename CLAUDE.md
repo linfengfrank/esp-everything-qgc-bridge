@@ -8,15 +8,19 @@ Autonomous drone swarm system for the SAFMC 2026 Cat Swarm Challenge. An ESP32-S
 
 ## Build & Flash (ESP-IDF)
 
-```bash
-# First time: clone MAVLink C library
-cd components/mavlink/include && git clone --depth 1 https://github.com/mavlink/c_library_v2.git . && cd -
+ESP-IDF is the only external dependency; everything else (MAVLink c_library_v2,
+esp-apriltag, VL53L5CX, managed_components/) is committed in-tree. The pinned
+ESP-IDF version lives in `tools/idf-pin.env`.
 
+```bash
 # Build
 idf.py build
 
 # Flash and monitor (adjust port as needed)
 idf.py -p /dev/ttyUSB0 flash monitor
+
+# Per-drone build+flash (pins CONFIG_DRONE_ID + host IP, restores sdkconfig after)
+./flash_drone.sh 22 /dev/tty.usbmodem2101
 
 # Per-drone config (drone ID, GPIO pins, WiFi, front sensor index)
 idf.py menuconfig   # under "Drone Configuration"
@@ -24,7 +28,7 @@ idf.py menuconfig   # under "Drone Configuration"
 
 ## Laptop-side scripts
 
-Run from the `laptop/` directory. Requires Python 3.10+ with `pyyaml` and `matplotlib`.
+Run from the `laptop/` directory. Requires Python 3.10+: `python3 -m pip install -r laptop/requirements.txt`.
 
 ```bash
 # Full mission (exploration + relay phases, interactive prompts)

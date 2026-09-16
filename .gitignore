@@ -2,3 +2,12 @@ build/
 .cache/
 .vscode/
 
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+venv/
+.venv/
+
+# macOS
+.DS_Store
