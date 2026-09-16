@@ -98,6 +98,13 @@ void camera_to_ned(float tx, float ty, float tz,
 #endif
 
 #include "esp_camera.h"
+#include "img_converters.h"
+#include "wifi_task.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
 
 #define CAMERA_MODEL_XIAO_ESP32S3
 
@@ -185,6 +192,154 @@ static esp_err_t init_camera(void)
  * short: detection time dominates the loop period, and this delay adds
  * directly to tag-detection latency. */
 #define LOOP_DELAY_MS 20
+
+/* -------------------------------------------------------------------------
+ * On-demand camera preview
+ *
+ * The detector needs the native QVGA grayscale frame, so the sensor cannot
+ * simply be switched to JPEG mode.  Once detection is complete, frame2jpg_cb
+ * software-encodes that same frame and the callback sends MTU-safe UDP
+ * chunks.  camera_stream.py reassembles them.  No work is done unless the
+ * viewer's keepalive has enabled the stream.
+ * ------------------------------------------------------------------------- */
+#define CAMERA_STREAM_MAGIC          "ECAM"
+#define CAMERA_STREAM_VERSION        1
+#define CAMERA_STREAM_FLAG_START     0x01
+#define CAMERA_STREAM_FLAG_END       0x02
+#define CAMERA_STREAM_CHUNK_BYTES    1200
+#define CAMERA_STREAM_JPEG_QUALITY   60
+#define CAMERA_STREAM_INTERVAL_MS    500u   /* at most 2 preview fps */
+
+typedef struct __attribute__((packed)) {
+    uint8_t  magic[4];
+    uint8_t  version;
+    uint8_t  flags;
+    uint8_t  drone_id;
+    uint8_t  reserved;
+    uint32_t frame_id;
+    uint32_t offset;
+    uint32_t frame_size;  /* zero for data chunks; total bytes in END packet */
+    uint16_t width;
+    uint16_t height;
+    uint16_t payload_len;
+} camera_stream_header_t;
+
+typedef struct {
+    int       sock;
+    uint8_t  *packet;
+    uint32_t  frame_id;
+    uint32_t  total_bytes;
+    uint32_t  last_frame_ms;
+    uint16_t  width;
+    uint16_t  height;
+} camera_stream_ctx_t;
+
+static void camera_stream_send_packet(camera_stream_ctx_t *ctx,
+                                      uint8_t flags, uint32_t offset,
+                                      uint32_t frame_size,
+                                      const uint8_t *payload,
+                                      uint16_t payload_len)
+{
+    if (ctx->sock < 0 || ctx->packet == NULL) return;
+
+    camera_stream_header_t hdr = {};
+    memcpy(hdr.magic, CAMERA_STREAM_MAGIC, sizeof(hdr.magic));
+    hdr.version     = CAMERA_STREAM_VERSION;
+    hdr.flags       = flags;
+    hdr.drone_id    = CONFIG_DRONE_ID;
+    hdr.frame_id    = ctx->frame_id;
+    hdr.offset      = offset;
+    hdr.frame_size  = frame_size;
+    hdr.width       = ctx->width;
+    hdr.height      = ctx->height;
+    hdr.payload_len = payload_len;
+
+    memcpy(ctx->packet, &hdr, sizeof(hdr));
+    if (payload_len > 0) {
+        memcpy(ctx->packet + sizeof(hdr), payload, payload_len);
+    }
+
+    /* The socket is non-blocking.  Losing a chunk drops only this preview
+     * frame; flight-control and detector tasks must never wait for video. */
+    send(ctx->sock, ctx->packet, sizeof(hdr) + payload_len, 0);
+}
+
+static size_t camera_stream_jpeg_cb(void *arg, size_t index,
+                                   const void *data, size_t len)
+{
+    camera_stream_ctx_t *ctx = (camera_stream_ctx_t *)arg;
+    const uint8_t *src = (const uint8_t *)data;
+    size_t sent = 0;
+
+    while (sent < len) {
+        size_t remaining = len - sent;
+        uint16_t chunk_len = (uint16_t)(remaining > CAMERA_STREAM_CHUNK_BYTES
+                                       ? CAMERA_STREAM_CHUNK_BYTES : remaining);
+        uint8_t flags = (index + sent == 0) ? CAMERA_STREAM_FLAG_START : 0;
+        camera_stream_send_packet(ctx, flags, (uint32_t)(index + sent), 0,
+                                  src + sent, chunk_len);
+        sent += chunk_len;
+    }
+    ctx->total_bytes = (uint32_t)(index + len);
+
+    /* Tell the encoder all bytes were consumed even if UDP dropped one. */
+    return len;
+}
+
+static void camera_stream_init(camera_stream_ctx_t *ctx)
+{
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->sock = -1;
+    ctx->packet = malloc(sizeof(camera_stream_header_t)
+                         + CAMERA_STREAM_CHUNK_BYTES);
+    if (ctx->packet == NULL) {
+        ESP_LOGW(TAG, "Camera preview packet allocation failed");
+        return;
+    }
+
+    ctx->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (ctx->sock < 0) {
+        ESP_LOGW(TAG, "Camera preview socket failed: errno %d", errno);
+        free(ctx->packet);
+        ctx->packet = NULL;
+        return;
+    }
+
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(WIFI_CAMERA_STREAM_PORT),
+    };
+    inet_aton(CONFIG_HOST_IPV4_ADDR, &dest.sin_addr);
+    connect(ctx->sock, (struct sockaddr *)&dest, sizeof(dest));
+
+    int flags = fcntl(ctx->sock, F_GETFL, 0);
+    if (flags >= 0) fcntl(ctx->sock, F_SETFL, flags | O_NONBLOCK);
+}
+
+static void camera_stream_frame(camera_stream_ctx_t *ctx, camera_fb_t *pic)
+{
+    if (!wifi_camera_stream_enabled() || ctx->sock < 0) return;
+
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    if ((uint32_t)(now_ms - ctx->last_frame_ms) < CAMERA_STREAM_INTERVAL_MS)
+        return;
+
+    ctx->last_frame_ms = now_ms;
+    ctx->frame_id++;
+    ctx->total_bytes = 0;
+    ctx->width  = (uint16_t)pic->width;
+    ctx->height = (uint16_t)pic->height;
+
+    if (!frame2jpg_cb(pic, CAMERA_STREAM_JPEG_QUALITY,
+                      camera_stream_jpeg_cb, ctx)) {
+        ESP_LOGW(TAG, "Camera preview JPEG encoding failed");
+        return;
+    }
+
+    camera_stream_send_packet(ctx, CAMERA_STREAM_FLAG_END,
+                              ctx->total_bytes, ctx->total_bytes,
+                              NULL, 0);
+}
 
 static volatile bool  s_land_requested = false;
 static volatile int   s_last_tag_id = -1;
@@ -294,21 +449,8 @@ void at_detect_task(void* pvParams)
     if(ESP_OK != init_camera()) {
         return;
     }
-    // Socket setup
-
-    // int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    // if (sock < 0){
-    //   ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-    //   return;
-    // }
-
-    // int opt = 1;
-    // setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    // const struct sockaddr_in target_addr = {
-    //   .sin_addr.s_addr = inet_addr(CONFIG_HOST_IPV4_ADDR),
-    //   .sin_family      = AF_INET,
-    //   .sin_port        = htons(CONFIG_APRILTAG_SEND_PORT),
-    // };
+    camera_stream_ctx_t stream;
+    camera_stream_init(&stream);
 
     // Create tag family object
     apriltag_family_t *tf = tag16h5_create();
@@ -494,6 +636,8 @@ void at_detect_task(void* pvParams)
 
         // cleanup
         apriltag_detections_destroy(at_detections);
+
+        camera_stream_frame(&stream, pic);
 
         esp_camera_fb_return(pic);
 
