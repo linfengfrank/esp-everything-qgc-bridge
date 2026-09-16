@@ -2,7 +2,7 @@
 #
 # Build and flash one drone.
 #
-#   ./flash_drone.sh            # prompts for drone id, then port
+#   ./flash_drone.sh            # prompts for drone id and port
 #   ./flash_drone.sh 22         # drone 22, prompts for port
 #   ./flash_drone.sh 22 /dev/tty.usbmodem2101
 #
@@ -13,8 +13,12 @@ set -euo pipefail
 
 PORT_DEFAULT="/dev/tty.usbmodem2101"
 ID_MAX=30                  # main/Kconfig.projbuild: config DRONE_ID, range 0 30
-IP_PREFIX="192.168.1"      # host IP last octet = IP_BASE + drone id
-IP_BASE=100
+HOST_IP_PREFIX="192.168.1"   # QGC/laptop IP = HOST_IP_BASE + drone id
+HOST_IP_BASE=100
+DRONE_IP_PREFIX="192.168.1"  # ESP32 IP = DRONE_IP_BASE + drone id
+DRONE_IP_BASE=200
+WIFI_GATEWAY="192.168.1.1"
+WIFI_NETMASK="255.255.255.0"
 
 die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -27,6 +31,19 @@ SDKCONFIG="$PROJECT_DIR/sdkconfig"
 [ -f "$SDKCONFIG" ] || die "no sdkconfig in $PROJECT_DIR"
 git ls-files --error-unmatch sdkconfig >/dev/null 2>&1 \
   || die "sdkconfig is not tracked by git -- refusing to edit a file we cannot restore"
+
+# Never infer which physical drone is attached. An explicit argument supports
+# automation; otherwise require the operator to identify it before sdkconfig
+# or the build directory is changed.
+DRONE_ID="${1:-}"
+if [ -z "$DRONE_ID" ]; then
+    read -r -p "Drone ID (0-$ID_MAX): " DRONE_ID \
+        || die "drone id is required"
+fi
+case "$DRONE_ID" in ''|*[!0-9]*) die "drone id must be a whole number 0-$ID_MAX";; esac
+[ "${#DRONE_ID}" -le 2 ] || die "drone id must be 0-$ID_MAX"   # also blocks $(( )) overflow
+DRONE_ID=$((10#$DRONE_ID))                                      # 08 -> 8, not octal
+[ "$DRONE_ID" -le "$ID_MAX" ] || die "drone id $DRONE_ID is outside the Kconfig range 0-$ID_MAX"
 
 # ---------------------------------------------------------------- 1. ESP-IDF
 step "ESP-IDF environment"
@@ -138,36 +155,45 @@ echo "sdkconfig reset to HEAD"
 
 # ------------------------------------------------------------- 3. Drone ID
 step "Drone configuration"
-DRONE_ID="${1:-}"
-if [ -z "$DRONE_ID" ]; then
-    read -r -p "Drone ID (0-$ID_MAX): " DRONE_ID || die "no input: pass the drone id as an argument"
-fi
-case "$DRONE_ID" in ''|*[!0-9]*) die "drone id must be a whole number 0-$ID_MAX";; esac
-[ "${#DRONE_ID}" -le 2 ] || die "drone id must be 0-$ID_MAX"   # also blocks $(( )) overflow
-DRONE_ID=$((10#$DRONE_ID))                                      # 08 -> 8, not octal
-[ "$DRONE_ID" -le "$ID_MAX" ] || die "drone id $DRONE_ID is outside the Kconfig range 0-$ID_MAX"
-HOST_IP="$IP_PREFIX.$((IP_BASE + DRONE_ID))"
+HOST_IP="$HOST_IP_PREFIX.$((HOST_IP_BASE + DRONE_ID))"
+DRONE_IP="$DRONE_IP_PREFIX.$((DRONE_IP_BASE + DRONE_ID))"
 
 # awk, not sed -i: no BSD/GNU incompatibility, exact prefix match, appends if absent.
 TMP="$(mktemp -t sdkconfig.new)"
-awk -v id="$DRONE_ID" -v ip="$HOST_IP" '
+awk -v id="$DRONE_ID" -v host_ip="$HOST_IP" -v drone_ip="$DRONE_IP" \
+    -v gateway="$WIFI_GATEWAY" -v netmask="$WIFI_NETMASK" '
   index($0, "CONFIG_DRONE_ID=")                  == 1 { print "CONFIG_DRONE_ID=" id;            si=1; next }
   index($0, "# CONFIG_DRONE_ID is not set")      == 1 { print "CONFIG_DRONE_ID=" id;            si=1; next }
-  index($0, "CONFIG_HOST_IPV4_ADDR=")            == 1 { print "CONFIG_HOST_IPV4_ADDR=\"" ip "\""; sp=1; next }
-  index($0, "# CONFIG_HOST_IPV4_ADDR is not set")== 1 { print "CONFIG_HOST_IPV4_ADDR=\"" ip "\""; sp=1; next }
+  index($0, "CONFIG_HOST_IPV4_ADDR=")                    == 1 { print "CONFIG_HOST_IPV4_ADDR=\"" host_ip "\""; sh=1; next }
+  index($0, "# CONFIG_HOST_IPV4_ADDR is not set")        == 1 { print "CONFIG_HOST_IPV4_ADDR=\"" host_ip "\""; sh=1; next }
+  index($0, "CONFIG_DRONE_STATIC_IPV4_ADDR=")            == 1 { print "CONFIG_DRONE_STATIC_IPV4_ADDR=\"" drone_ip "\""; sd=1; next }
+  index($0, "# CONFIG_DRONE_STATIC_IPV4_ADDR is not set")== 1 { print "CONFIG_DRONE_STATIC_IPV4_ADDR=\"" drone_ip "\""; sd=1; next }
+  index($0, "CONFIG_WIFI_GATEWAY_IPV4_ADDR=")            == 1 { print "CONFIG_WIFI_GATEWAY_IPV4_ADDR=\"" gateway "\""; sg=1; next }
+  index($0, "# CONFIG_WIFI_GATEWAY_IPV4_ADDR is not set")== 1 { print "CONFIG_WIFI_GATEWAY_IPV4_ADDR=\"" gateway "\""; sg=1; next }
+  index($0, "CONFIG_WIFI_NETMASK_IPV4_ADDR=")             == 1 { print "CONFIG_WIFI_NETMASK_IPV4_ADDR=\"" netmask "\""; sn=1; next }
+  index($0, "# CONFIG_WIFI_NETMASK_IPV4_ADDR is not set") == 1 { print "CONFIG_WIFI_NETMASK_IPV4_ADDR=\"" netmask "\""; sn=1; next }
   { print }
   END { if (!si) print "CONFIG_DRONE_ID=" id
-        if (!sp) print "CONFIG_HOST_IPV4_ADDR=\"" ip "\"" }
+        if (!sh) print "CONFIG_HOST_IPV4_ADDR=\"" host_ip "\""
+        if (!sd) print "CONFIG_DRONE_STATIC_IPV4_ADDR=\"" drone_ip "\""
+        if (!sg) print "CONFIG_WIFI_GATEWAY_IPV4_ADDR=\"" gateway "\""
+        if (!sn) print "CONFIG_WIFI_NETMASK_IPV4_ADDR=\"" netmask "\"" }
 ' "$SDKCONFIG" > "$TMP"
 cat "$TMP" > "$SDKCONFIG"      # keep the original inode/permissions
 rm -f "$TMP"
 
 # A substitution that matched nothing exits 0, so verify before burning a build on it.
-grep -Fxq "CONFIG_DRONE_ID=$DRONE_ID"            "$SDKCONFIG" || die "failed to set CONFIG_DRONE_ID"
-grep -Fxq "CONFIG_HOST_IPV4_ADDR=\"$HOST_IP\""   "$SDKCONFIG" || die "failed to set CONFIG_HOST_IPV4_ADDR"
-[ "$(grep -c '^CONFIG_DRONE_ID=' "$SDKCONFIG")"       -eq 1 ] || die "duplicate CONFIG_DRONE_ID lines"
-[ "$(grep -c '^CONFIG_HOST_IPV4_ADDR=' "$SDKCONFIG")" -eq 1 ] || die "duplicate CONFIG_HOST_IPV4_ADDR lines"
-echo "drone $DRONE_ID  ->  host $HOST_IP"
+grep -Fxq "CONFIG_DRONE_ID=$DRONE_ID"                    "$SDKCONFIG" || die "failed to set CONFIG_DRONE_ID"
+grep -Fxq "CONFIG_HOST_IPV4_ADDR=\"$HOST_IP\""           "$SDKCONFIG" || die "failed to set CONFIG_HOST_IPV4_ADDR"
+grep -Fxq "CONFIG_DRONE_STATIC_IPV4_ADDR=\"$DRONE_IP\"" "$SDKCONFIG" || die "failed to set CONFIG_DRONE_STATIC_IPV4_ADDR"
+grep -Fxq "CONFIG_WIFI_GATEWAY_IPV4_ADDR=\"$WIFI_GATEWAY\"" "$SDKCONFIG" || die "failed to set CONFIG_WIFI_GATEWAY_IPV4_ADDR"
+grep -Fxq "CONFIG_WIFI_NETMASK_IPV4_ADDR=\"$WIFI_NETMASK\"" "$SDKCONFIG" || die "failed to set CONFIG_WIFI_NETMASK_IPV4_ADDR"
+[ "$(grep -c '^CONFIG_DRONE_ID=' "$SDKCONFIG")"                   -eq 1 ] || die "duplicate CONFIG_DRONE_ID lines"
+[ "$(grep -c '^CONFIG_HOST_IPV4_ADDR=' "$SDKCONFIG")"             -eq 1 ] || die "duplicate CONFIG_HOST_IPV4_ADDR lines"
+[ "$(grep -c '^CONFIG_DRONE_STATIC_IPV4_ADDR=' "$SDKCONFIG")"     -eq 1 ] || die "duplicate CONFIG_DRONE_STATIC_IPV4_ADDR lines"
+[ "$(grep -c '^CONFIG_WIFI_GATEWAY_IPV4_ADDR=' "$SDKCONFIG")"     -eq 1 ] || die "duplicate CONFIG_WIFI_GATEWAY_IPV4_ADDR lines"
+[ "$(grep -c '^CONFIG_WIFI_NETMASK_IPV4_ADDR=' "$SDKCONFIG")"     -eq 1 ] || die "duplicate CONFIG_WIFI_NETMASK_IPV4_ADDR lines"
+echo "drone $DRONE_ID  ->  QGC $HOST_IP, ESP32 static IP $DRONE_IP"
 
 # ---------------------------------------------------------------- 4. Build
 step "Building drone $DRONE_ID"
@@ -178,9 +204,15 @@ idf.py build
 HDR="$PROJECT_DIR/build/config/sdkconfig.h"
 grep -Fxq "#define CONFIG_DRONE_ID $DRONE_ID"              "$HDR" \
     || die "built binary is NOT drone $DRONE_ID ($(grep -m1 'define CONFIG_DRONE_ID ' "$HDR")) -- not flashing"
-grep -Fxq "#define CONFIG_HOST_IPV4_ADDR \"$HOST_IP\""     "$HDR" \
-    || die "built binary has the wrong host IP -- not flashing"
-echo "verified: firmware is drone $DRONE_ID, host $HOST_IP"
+grep -Fxq "#define CONFIG_HOST_IPV4_ADDR \"$HOST_IP\"" "$HDR" \
+    || die "built binary has the wrong QGC/laptop IP -- not flashing"
+grep -Fxq "#define CONFIG_DRONE_STATIC_IPV4_ADDR \"$DRONE_IP\"" "$HDR" \
+    || die "built binary has the wrong drone static IP -- not flashing"
+grep -Fxq "#define CONFIG_WIFI_GATEWAY_IPV4_ADDR \"$WIFI_GATEWAY\"" "$HDR" \
+    || die "built binary has the wrong WiFi gateway -- not flashing"
+grep -Fxq "#define CONFIG_WIFI_NETMASK_IPV4_ADDR \"$WIFI_NETMASK\"" "$HDR" \
+    || die "built binary has the wrong WiFi netmask -- not flashing"
+echo "verified: firmware is drone $DRONE_ID, QGC $HOST_IP, ESP32 $DRONE_IP"
 
 # ---------------------------------------------------------------- 5. Flash
 step "Flashing drone $DRONE_ID"
@@ -207,4 +239,5 @@ esac
 
 idf.py -p "$PORT" flash
 echo
-echo "flashed drone $DRONE_ID ($HOST_IP) on $PORT"
+echo "flashed drone $DRONE_ID (ESP32 $DRONE_IP, QGC $HOST_IP) on $PORT"
+echo "camera: python3 laptop/camera_stream.py --esp-ip $DRONE_IP"
