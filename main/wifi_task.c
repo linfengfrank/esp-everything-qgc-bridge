@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -31,12 +32,49 @@ static const char *TAG = "wifi";
 static volatile bool s_land_requested  = false;
 static volatile bool s_start_requested = false;
 static volatile bool s_wifi_connected  = false;
+static volatile bool s_camera_stream_requested = false;
+static volatile uint32_t s_camera_stream_keepalive_ms = 0;
+
+/* Viewer refreshes its request once per second. */
+#define CAMERA_STREAM_TIMEOUT_MS 2500u
 
 /* Peer drone positions (map frame), protected by s_peer_mutex */
 static wifi_peer_list_t   s_peers = { .count = 0 };
 static SemaphoreHandle_t  s_peer_mutex;
 
 static EventGroupHandle_t s_wifi_events;
+
+static uint32_t parse_ipv4_or_abort(const char *name, const char *value)
+{
+    uint32_t addr = esp_ip4addr_aton(value);
+    if (addr == IPADDR_NONE) {
+        ESP_LOGE(TAG, "Invalid %s IPv4 address: %s", name, value);
+        abort();
+    }
+    return addr;
+}
+
+static void configure_static_ip(esp_netif_t *sta_netif)
+{
+    esp_err_t err = esp_netif_dhcpc_stop(sta_netif);
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+        ESP_ERROR_CHECK(err);
+    }
+
+    esp_netif_ip_info_t ip_info = {};
+    ip_info.ip.addr = parse_ipv4_or_abort(
+        "drone static", CONFIG_DRONE_STATIC_IPV4_ADDR);
+    ip_info.gw.addr = parse_ipv4_or_abort(
+        "gateway", CONFIG_WIFI_GATEWAY_IPV4_ADDR);
+    ip_info.netmask.addr = parse_ipv4_or_abort(
+        "netmask", CONFIG_WIFI_NETMASK_IPV4_ADDR);
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(sta_netif, &ip_info));
+
+    ESP_LOGI(TAG, "Static IP: %s (gateway %s, netmask %s)",
+             CONFIG_DRONE_STATIC_IPV4_ADDR,
+             CONFIG_WIFI_GATEWAY_IPV4_ADDR,
+             CONFIG_WIFI_NETMASK_IPV4_ADDR);
+}
 
 /* ---------------------------------------------------------------------------
  * WiFi event handler — auto-reconnect on disconnect
@@ -67,7 +105,9 @@ void wifi_task_init(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    configASSERT(sta_netif != NULL);
+    configure_static_ip(sta_netif);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -276,7 +316,19 @@ void wifi_task(void *arg)
             uint8_t cmd_buf[256];
             int len = recvfrom(rx_sock, cmd_buf, sizeof(cmd_buf), 0, NULL, NULL);
             if (len >= 2 && cmd_buf[0] == WIFI_PKT_CMD) {
-                if (cmd_buf[1] == CMD_SET_NAV_TAGS) {
+                if (cmd_buf[1] == CMD_CAMERA_STREAM && len >= 3) {
+                    bool enable = cmd_buf[2] != 0;
+                    bool was_enabled = wifi_camera_stream_enabled();
+                    s_camera_stream_requested = enable;
+                    if (enable) {
+                        s_camera_stream_keepalive_ms =
+                            (uint32_t)(esp_timer_get_time() / 1000);
+                    }
+                    if (enable != was_enabled) {
+                        ESP_LOGI(TAG, "Camera preview %s",
+                                 enable ? "enabled" : "disabled");
+                    }
+                } else if (cmd_buf[1] == CMD_SET_NAV_TAGS) {
                     handle_nav_tags(cmd_buf, len);
                 } else if (cmd_buf[1] == CMD_SET_PEERS) {
                     handle_peers(cmd_buf, len);
@@ -390,4 +442,12 @@ void wifi_clear_start_request(void)
 bool wifi_is_connected(void)
 {
     return s_wifi_connected;
+}
+
+bool wifi_camera_stream_enabled(void)
+{
+    if (!s_camera_stream_requested) return false;
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    return (uint32_t)(now_ms - s_camera_stream_keepalive_ms)
+           < CAMERA_STREAM_TIMEOUT_MS;
 }

@@ -5,7 +5,7 @@ Telemetry (ESP32 → laptop, 10 Hz):
     Fixed-size packet.
 
 Command (laptop → ESP32, event-driven):
-    Fixed 18-byte packet.
+    Fixed 22-byte mission packet, plus variable-size control packets.
 """
 
 import math
@@ -22,6 +22,7 @@ PKT_CMD       = 0x02   # command to drone
 PKT_AT_DEBUG  = 0x04   # live AprilTag detections (debug stream)
 
 AT_DEBUG_PORT = 5008   # UDP port the AprilTag debug stream arrives on
+CAMERA_STREAM_PORT = 5009
 
 CMD_GOTO          = 0x01   # navigate to (goal_x, goal_y)
 CMD_LAND          = 0x02   # land immediately
@@ -29,6 +30,7 @@ CMD_HOLD          = 0x03   # hold position, cancel goal
 CMD_SET_NAV_TAGS  = 0x04   # send navigation tag map positions to drone
 CMD_START         = 0x05   # arm and take off
 CMD_SET_PEERS     = 0x06   # update nearby drone positions for inter-drone avoidance
+CMD_CAMERA_STREAM = 0x07   # on-demand camera preview keepalive
 
 VFH_BINS    = 32
 
@@ -208,6 +210,74 @@ def build_command(cmd: CommandPacket) -> bytes:
     tag_ids = (cmd.found_tag_ids + [-1] * MAX_FOUND_TAGS)[:MAX_FOUND_TAGS]
     return struct.pack(_CMD_FMT, PKT_CMD, cmd.cmd_type,
                        cmd.goal_x, cmd.goal_y, *tag_ids)
+
+
+def build_camera_stream_command(enabled: bool = True) -> bytes:
+    """Build the 3-byte camera-preview enable/keepalive command."""
+    return struct.pack("<BBB", PKT_CMD, CMD_CAMERA_STREAM, int(enabled))
+
+
+# ---------------------------------------------------------------------------
+# Camera JPEG chunk (drone → laptop, UDP port CAMERA_STREAM_PORT)
+# ---------------------------------------------------------------------------
+
+CAMERA_MAGIC       = b"ECAM"
+CAMERA_VERSION     = 1
+CAMERA_FLAG_START  = 0x01
+CAMERA_FLAG_END    = 0x02
+
+# magic, version, flags, drone_id, reserved, frame_id, offset, frame_size,
+# width, height, payload_len.  Integers are little-endian like the rest of the
+# project's wire protocol.
+_CAMERA_HDR_FMT  = "<4sBBBBIIIHHH"
+_CAMERA_HDR_SIZE = struct.calcsize(_CAMERA_HDR_FMT)  # 26 bytes
+
+
+@dataclass
+class CameraChunk:
+    flags:        int
+    drone_id:     int
+    frame_id:     int
+    offset:       int
+    frame_size:   int
+    width:        int
+    height:       int
+    payload:      bytes
+
+    @property
+    def is_end(self) -> bool:
+        return bool(self.flags & CAMERA_FLAG_END)
+
+
+def parse_camera_chunk(data: bytes) -> Optional[CameraChunk]:
+    """Parse one camera UDP datagram. Returns None for malformed data."""
+    if len(data) < _CAMERA_HDR_SIZE:
+        return None
+
+    (magic, version, flags, drone_id, _reserved, frame_id, offset,
+     frame_size, width, height, payload_len) = struct.unpack_from(
+         _CAMERA_HDR_FMT, data, 0)
+
+    if magic != CAMERA_MAGIC or version != CAMERA_VERSION:
+        return None
+    if payload_len != len(data) - _CAMERA_HDR_SIZE:
+        return None
+    if flags & CAMERA_FLAG_END:
+        if payload_len != 0 or frame_size == 0 or offset != frame_size:
+            return None
+    elif frame_size != 0:
+        return None
+
+    return CameraChunk(
+        flags=flags,
+        drone_id=drone_id,
+        frame_id=frame_id,
+        offset=offset,
+        frame_size=frame_size,
+        width=width,
+        height=height,
+        payload=data[_CAMERA_HDR_SIZE:],
+    )
 
 
 # ---------------------------------------------------------------------------
