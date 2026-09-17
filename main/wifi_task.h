@@ -22,9 +22,7 @@
 /* Separate UDP port for the live AprilTag debug stream (tag_debug.py) */
 #define WIFI_AT_DEBUG_PORT   5008
 
-/* On-demand JPEG camera preview (camera_stream.py).  Frames are split into
- * application-level UDP chunks by at_detect_task so no datagram exceeds the
- * network MTU. */
+/* On-demand JPEG camera preview (camera_stream.c -> camera_stream.py). */
 #define WIFI_CAMERA_STREAM_PORT  5009
 
 /* Pixels per sensor frame (8×8 grid) — duplicated here to avoid pulling in tof_task.h */
@@ -73,7 +71,7 @@ typedef struct __attribute__((packed)) {
 #define CMD_SET_NAV_TAGS  0x04
 #define CMD_START         0x05   /* arm and take off */
 #define CMD_SET_PEERS     0x06   /* update nearby drone positions */
-#define CMD_CAMERA_STREAM 0x07   /* 3-byte packet: pkt, cmd, enable */
+#define CMD_CAMERA_STREAM 0x07   /* keepalive: pkt, cmd, enable, max_fps, quality */
 
 /* ---------------------------------------------------------------------------
  * Navigation-tag position packet — received from laptop over UDP.
@@ -189,3 +187,12 @@ bool wifi_is_connected(void);
 /* True while camera_stream.py is sending keepalives.  The request expires
  * automatically, so a crashed viewer cannot leave JPEG encoding enabled. */
 bool wifi_camera_stream_enabled(void);
+
+/* Latest preview request (0 = firmware default); returns
+ * wifi_camera_stream_enabled(). */
+typedef struct {
+    uint8_t max_fps;
+    uint8_t quality;
+} wifi_camera_stream_req_t;
+
+bool wifi_camera_stream_get(wifi_camera_stream_req_t *out);

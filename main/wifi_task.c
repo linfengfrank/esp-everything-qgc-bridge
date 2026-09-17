@@ -35,6 +35,10 @@ static volatile bool s_wifi_connected  = false;
 static volatile bool s_camera_stream_requested = false;
 static volatile uint32_t s_camera_stream_keepalive_ms = 0;
 
+/* Viewer-requested preview fps | quality << 8 (0 = firmware default), in one
+ * word so the stream task on the other core reads a consistent pair. */
+static volatile uint32_t s_camera_stream_params = 0;
+
 /* Viewer refreshes its request once per second. */
 #define CAMERA_STREAM_TIMEOUT_MS 2500u
 
@@ -238,6 +242,27 @@ static void handle_peers(const uint8_t *buf, int len)
     ESP_LOGD(TAG, "CMD_SET_PEERS: %d peers", count);
 }
 
+/* CMD_CAMERA_STREAM keepalive: pkt, cmd, enable [, max_fps, quality]. */
+static void handle_camera_stream(const uint8_t *buf, int len)
+{
+    if (len < 3) return;
+    bool enable = buf[2] != 0;
+    uint32_t params = (len >= 5) ? (buf[3] | (uint32_t)buf[4] << 8) : 0;
+    bool changed = enable != wifi_camera_stream_enabled()
+                   || (enable && params != s_camera_stream_params);
+
+    if (enable) {
+        s_camera_stream_params = params;
+        s_camera_stream_keepalive_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    }
+    s_camera_stream_requested = enable;
+    if (changed) {
+        ESP_LOGI(TAG, "Camera preview %s (fps=%u q=%u, 0 = default)",
+                 enable ? "on" : "off", (unsigned)(params & 0xFF),
+                 (unsigned)(params >> 8));
+    }
+}
+
 wifi_peer_list_t wifi_get_peers(void)
 {
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
@@ -316,18 +341,8 @@ void wifi_task(void *arg)
             uint8_t cmd_buf[256];
             int len = recvfrom(rx_sock, cmd_buf, sizeof(cmd_buf), 0, NULL, NULL);
             if (len >= 2 && cmd_buf[0] == WIFI_PKT_CMD) {
-                if (cmd_buf[1] == CMD_CAMERA_STREAM && len >= 3) {
-                    bool enable = cmd_buf[2] != 0;
-                    bool was_enabled = wifi_camera_stream_enabled();
-                    s_camera_stream_requested = enable;
-                    if (enable) {
-                        s_camera_stream_keepalive_ms =
-                            (uint32_t)(esp_timer_get_time() / 1000);
-                    }
-                    if (enable != was_enabled) {
-                        ESP_LOGI(TAG, "Camera preview %s",
-                                 enable ? "enabled" : "disabled");
-                    }
+                if (cmd_buf[1] == CMD_CAMERA_STREAM) {
+                    handle_camera_stream(cmd_buf, len);
                 } else if (cmd_buf[1] == CMD_SET_NAV_TAGS) {
                     handle_nav_tags(cmd_buf, len);
                 } else if (cmd_buf[1] == CMD_SET_PEERS) {
@@ -450,4 +465,12 @@ bool wifi_camera_stream_enabled(void)
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     return (uint32_t)(now_ms - s_camera_stream_keepalive_ms)
            < CAMERA_STREAM_TIMEOUT_MS;
+}
+
+bool wifi_camera_stream_get(wifi_camera_stream_req_t *out)
+{
+    uint32_t params = s_camera_stream_params;
+    out->max_fps = (uint8_t)params;
+    out->quality = (uint8_t)(params >> 8);
+    return wifi_camera_stream_enabled();
 }

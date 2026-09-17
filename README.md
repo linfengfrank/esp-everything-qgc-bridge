@@ -51,23 +51,16 @@ QGroundControl ↔ UDP 14550/8888 ↔ ESP32-S3 ↔ UART MAVLink ↔ PX4
 See `QGC_MAVLINK_BRIDGE.md` for setup and debugging notes.
 ## ESP32 camera preview
 
-The onboard QVGA grayscale camera can be viewed over WiFi without changing
-the AprilTag detector's camera format. The viewer requests the stream on
-demand; firmware JPEG-compresses completed detector frames and sends them as
-MTU-safe UDP chunks on port 5009.
-
-Install the laptop dependencies, reflash this firmware, and run:
+View a drone's camera over WiFi (drone IP = `192.168.1.(200 + drone ID)`;
+the laptop must be `CONFIG_HOST_IPV4_ADDR`):
 
 ```bash
-python3 -m pip install -r laptop/requirements.txt
-python3 laptop/camera_stream.py --esp-ip 192.168.1.222
+python3 laptop/camera_stream.py --esp-ip 192.168.1.222 [--fps 10] [--quality 60]
 ```
 
-This example targets drone 22; replace the final octet using the mapping
-below. The laptop must also be the address configured by
-`CONFIG_HOST_IPV4_ADDR`. Press `q` or Escape to exit and `s` to save a frame.
-The stream is capped at 2 fps to limit its effect on navigation and stops
-automatically when viewer keepalives cease.
+`q`/Esc quits, `s` saves a frame. The drone streams only while the viewer
+runs (~9 fps, ~130 ms from capture to the laptop on the OV3660). The overlay
+and the console show the drone-side frame age and dropped frames.
 
 ### Deterministic drone addresses
 
