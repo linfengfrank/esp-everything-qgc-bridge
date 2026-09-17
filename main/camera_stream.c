@@ -153,7 +153,7 @@ static void send_datagram(frame_t *f, uint8_t flags, uint16_t payload_len)
             f->err = (ret < 0) ? errno : 0;
             return;
         }
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(MAX(pdMS_TO_TICKS(2), 1));
     }
 }
 
@@ -289,6 +289,7 @@ void camera_stream_start(void)
     s_image  = heap_caps_malloc(MAX_PIXELS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_packet = heap_caps_malloc(sizeof(header_t) + CHUNK_BYTES,
                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    errno    = 0;   /* only socket() and connect() below set it */
     s_sock   = socket(AF_INET, SOCK_DGRAM, 0);
 
     /* The stack is in PSRAM too (internal RAM is tight), so this task must

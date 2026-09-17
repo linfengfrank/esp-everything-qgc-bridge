@@ -256,10 +256,11 @@ static void handle_camera_stream(const uint8_t *buf, int len)
         s_camera_stream_keepalive_ms = (uint32_t)(esp_timer_get_time() / 1000);
     }
     s_camera_stream_requested = enable;
-    if (changed) {
-        ESP_LOGI(TAG, "Camera preview %s (fps=%u q=%u, 0 = default)",
-                 enable ? "on" : "off", (unsigned)(params & 0xFF),
-                 (unsigned)(params >> 8));
+    if (changed && enable) {
+        ESP_LOGI(TAG, "Camera preview on (fps=%u q=%u, 0 = default)",
+                 (unsigned)(params & 0xFF), (unsigned)(params >> 8));
+    } else if (changed) {
+        ESP_LOGI(TAG, "Camera preview off");
     }
 }
 
