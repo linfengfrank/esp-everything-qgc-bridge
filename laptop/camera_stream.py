@@ -151,6 +151,10 @@ def _parse_args() -> argparse.Namespace:
                         help="window scale (default: 2)")
     args = parser.parse_args()
     try:
+        args.esp_ip = socket.gethostbyname(args.esp_ip)  # datagrams carry numeric IPs
+    except OSError:
+        parser.error(f"cannot resolve --esp-ip {args.esp_ip}")
+    try:
         build_camera_stream_command(True, args.fps, args.quality)
     except ValueError as exc:
         parser.error(str(exc))
@@ -241,8 +245,8 @@ def main() -> int:
                 break
             if key == ord("s") and image is not None:
                 path = time.strftime("esp32_camera_%Y%m%d_%H%M%S.png")
-                cv2.imwrite(path, image)
-                print(f"saved {path}")
+                print(f"saved {path}" if cv2.imwrite(path, image)
+                      else f"could not save {path}")
     except KeyboardInterrupt:
         pass
     finally:
