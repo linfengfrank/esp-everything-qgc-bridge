@@ -9,3 +9,6 @@ idf_component_register(SRCS ${APRILTAG_SRCS} ${TAG_FILES}  ${COMMON_SRC}
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -w)
 component_compile_options(-D__INT32_TYPE__=int)
+
+# Prefer PSRAM for every allocation in this library (see apriltag_psram_alloc.h).
+target_compile_options(${COMPONENT_LIB} PRIVATE -include ${CMAKE_CURRENT_LIST_DIR}/apriltag_psram_alloc.h)

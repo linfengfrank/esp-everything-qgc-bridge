@@ -1,313 +1,256 @@
 #!/usr/bin/env python3
-"""View the ESP32-S3 camera over the project's WiFi link.
+"""Live view of a drone's ESP32 camera over WiFi.
 
-The firmware keeps the sensor in QVGA grayscale mode for AprilTag detection.
-When this program sends a keepalive to the ESP32, completed detector frames
-are JPEG-compressed and sent as MTU-safe UDP chunks on port 5009.
+    python3 laptop/camera_stream.py --esp-ip 192.168.1.222 [--fps 10] [--quality 60]
 
-Example:
-
-    python3 laptop/camera_stream.py --esp-ip 192.168.1.222
-
-The ESP32 IP is printed as ``Got IP`` on its serial console.  The computer
-running this script must be CONFIG_HOST_IPV4_ADDR in the ESP32 configuration.
-
-Keys:
-    q or Escape  close the viewer
-    s            save the current (unannotated) frame
+The drone streams only while this viewer sends keepalives (wire format:
+main/camera_stream.c).  Keys: q/Esc quit, s save the current frame.
 """
 
 from __future__ import annotations
 
 import argparse
+import select
 import socket
 import sys
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from protocol import (
+    CAMERA_STREAM_MAX_FPS,
+    CAMERA_STREAM_MAX_QUALITY,
+    CAMERA_STREAM_MIN_QUALITY,
     CAMERA_STREAM_PORT,
+    CAMERA_VERSION,
     CameraChunk,
     build_camera_stream_command,
+    camera_packet_version,
     parse_camera_chunk,
 )
 
 COMMAND_PORT = 5006
-KEEPALIVE_INTERVAL_S = 1.0
-ASSEMBLY_TIMEOUT_S = 1.5
-MAX_JPEG_BYTES = 512 * 1024
+KEEPALIVE_S = 1.0
+FRAME_TIMEOUT_S = 0.75      # drop a frame still missing datagrams after this
+MAX_JPEG_BYTES = 256 * 1024
+MAX_PENDING = 16
+REBOOT_BACKSTEP = 32        # an id this far below the last shown one = reboot
+STATS_S = 2.0
 
 
 @dataclass
-class _PendingFrame:
-    drone_id: int
+class Frame:
     frame_id: int
-    width: int
-    height: int
-    source: tuple[str, int]
-    updated_at: float
-    pieces: dict[int, bytes] = field(default_factory=dict)
-    expected_size: int | None = None
-
-
-@dataclass
-class CompleteFrame:
-    drone_id: int
-    frame_id: int
-    width: int
-    height: int
-    source: tuple[str, int]
     jpeg: bytes
+    age_ms: int             # capture -> END sent, measured on the ESP32
+    esp_drops: int
+    first_rx: float         # when this frame's first datagram arrived
+
+
+@dataclass
+class _Pending:
+    first_rx: float
+    pieces: dict[int, bytes] = field(default_factory=dict)
+    size: int | None = None
 
 
 class FrameAssembler:
-    """Reassemble out-of-order JPEG chunks and discard incomplete frames."""
+    """Reassembles one drone's JPEG frames from out-of-order datagrams.
 
-    def __init__(self, timeout_s: float = ASSEMBLY_TIMEOUT_S):
-        self.timeout_s = timeout_s
-        self.pending: dict[tuple[str, int, int], _PendingFrame] = {}
-        self.dropped_frames = 0
+    Returns only frames newer than the last one returned.  `dropped` counts
+    frame ids skipped between returned frames (lost, incomplete or never
+    sent).  A new boot_nonce, or a large step back in frame_id, means the
+    drone rebooted and restarts the sequence.
+    """
+
+    def __init__(self) -> None:
+        self.pending: dict[int, _Pending] = {}
+        self.nonce: int | None = None
+        self.last_id: int | None = None
+        self.dropped = 0
+
+    def add(self, c: CameraChunk, now: float) -> Frame | None:
+        rebooted = (self.last_id is not None
+                    and c.frame_id + REBOOT_BACKSTEP < self.last_id)
+        if c.boot_nonce != self.nonce or rebooted:
+            self.nonce, self.last_id = c.boot_nonce, None
+            self.pending.clear()
+        if self.last_id is not None and c.frame_id <= self.last_id:
+            return None                             # late or duplicate
+
+        p = self.pending.get(c.frame_id)
+        if p is None:
+            if len(self.pending) >= MAX_PENDING:
+                del self.pending[min(self.pending)]
+            p = self.pending[c.frame_id] = _Pending(now)
+        if c.is_end:
+            p.size = c.frame_size
+        elif c.offset + len(c.payload) <= MAX_JPEG_BYTES:
+            p.pieces[c.offset] = c.payload
+        if p.size is None:
+            return None
+        parts, end = [], 0
+        for offset in sorted(p.pieces):
+            if offset != end:
+                return None                         # a datagram is still missing
+            parts.append(p.pieces[offset])
+            end += len(p.pieces[offset])
+        if end != p.size:
+            return None
+        if self.last_id is not None:
+            self.dropped += c.frame_id - self.last_id - 1
+        self.last_id = c.frame_id
+        self.pending = {k: v for k, v in self.pending.items() if k > c.frame_id}
+        return Frame(c.frame_id, b"".join(parts), c.age_ms, c.esp_drops, p.first_rx)
 
     def expire(self, now: float) -> None:
-        expired = [key for key, frame in self.pending.items()
-                   if now - frame.updated_at > self.timeout_s]
-        for key in expired:
-            del self.pending[key]
-            self.dropped_frames += 1
+        for k in [k for k, p in self.pending.items()
+                  if now - p.first_rx > FRAME_TIMEOUT_S]:
+            del self.pending[k]
 
-    def add(self, chunk: CameraChunk, source: tuple[str, int],
-            now: float) -> CompleteFrame | None:
-        self.expire(now)
 
-        key = (source[0], chunk.drone_id, chunk.frame_id)
-        frame = self.pending.get(key)
-        if frame is None:
-            frame = _PendingFrame(
-                drone_id=chunk.drone_id,
-                frame_id=chunk.frame_id,
-                width=chunk.width,
-                height=chunk.height,
-                source=source,
-                updated_at=now,
-            )
-            self.pending[key] = frame
+def drain_socket(sock: socket.socket, asm: FrameAssembler, esp_ip: str,
+                 max_datagrams: int = 2000):
+    """Read every queued datagram from esp_ip.
 
-        if (frame.width != chunk.width or frame.height != chunk.height
-                or chunk.offset > MAX_JPEG_BYTES
-                or chunk.offset + len(chunk.payload) > MAX_JPEG_BYTES):
-            del self.pending[key]
-            self.dropped_frames += 1
-            return None
-
-        frame.updated_at = now
-        if chunk.is_end:
-            if chunk.frame_size > MAX_JPEG_BYTES:
-                del self.pending[key]
-                self.dropped_frames += 1
-                return None
-            frame.expected_size = chunk.frame_size
-        elif chunk.payload:
-            frame.pieces[chunk.offset] = chunk.payload
-
-        return self._complete(key, frame)
-
-    def _complete(self, key: tuple[str, int, int],
-                  frame: _PendingFrame) -> CompleteFrame | None:
-        if frame.expected_size is None:
-            return None
-
-        offset = 0
-        ordered = []
-        for piece_offset in sorted(frame.pieces):
-            piece = frame.pieces[piece_offset]
-            if piece_offset != offset:
-                return None
-            ordered.append(piece)
-            offset += len(piece)
-
-        if offset != frame.expected_size:
-            return None
-
-        jpeg = b"".join(ordered)
-        del self.pending[key]
-        return CompleteFrame(
-            drone_id=frame.drone_id,
-            frame_id=frame.frame_id,
-            width=frame.width,
-            height=frame.height,
-            source=frame.source,
-            jpeg=jpeg,
-        )
+    Returns (newest frame or None, datagrams read, foreign ECAM version or
+    None).  Frames completed earlier in the same pass are counted as dropped.
+    """
+    newest, count, bad_version = None, 0, None
+    while count < max_datagrams:
+        try:
+            data, (ip, _) = sock.recvfrom(2048)
+        except (BlockingIOError, InterruptedError):
+            break
+        count += 1
+        if ip != esp_ip:
+            continue
+        chunk = parse_camera_chunk(data)
+        if chunk is None:
+            version = camera_packet_version(data)
+            if version not in (None, CAMERA_VERSION):
+                bad_version = version
+            continue
+        frame = asm.add(chunk, time.monotonic())
+        if frame is not None:
+            if newest is not None:
+                asm.dropped += 1
+            newest = frame
+    return newest, count, bad_version
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Display the ESP32 QVGA camera stream over UDP")
-    parser.add_argument(
-        "--esp-ip",
-        help="ESP32 IP from its serial 'Got IP' message (required unless --listen-only)",
-    )
-    parser.add_argument(
-        "--listen-only", action="store_true",
-        help="Do not send stream keepalives (use only if another client enabled it)",
-    )
-    parser.add_argument("--bind", default="0.0.0.0",
-                        help="Local interface to bind (default: all)")
-    parser.add_argument("--port", type=int, default=CAMERA_STREAM_PORT,
-                        help=f"Local stream port (default: {CAMERA_STREAM_PORT})")
-    parser.add_argument("--command-port", type=int, default=COMMAND_PORT,
-                        help=f"ESP32 command port (default: {COMMAND_PORT})")
-    parser.add_argument("--drone-id", type=int,
-                        help="Ignore frames from other drone IDs")
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--esp-ip", required=True,
+                        help="drone IP, 192.168.1.(200 + drone id)")
+    parser.add_argument("--fps", type=int, default=0,
+                        help=f"1-{CAMERA_STREAM_MAX_FPS} (default: firmware, 10)")
+    parser.add_argument("--quality", type=int, default=0,
+                        help=f"JPEG quality {CAMERA_STREAM_MIN_QUALITY}-"
+                             f"{CAMERA_STREAM_MAX_QUALITY} (default: firmware, 60)")
     parser.add_argument("--scale", type=float, default=2.0,
-                        help="Display scale factor (default: 2.0)")
-    parser.add_argument("--save-dir", type=Path, default=Path("camera_frames"),
-                        help="Directory used by the 's' key")
+                        help="window scale (default: 2)")
     args = parser.parse_args()
-
-    if not args.listen_only and not args.esp_ip:
-        parser.error("--esp-ip is required unless --listen-only is used")
+    try:
+        build_camera_stream_command(True, args.fps, args.quality)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.scale <= 0:
-        parser.error("--scale must be greater than zero")
-    if args.drone_id is not None and not 0 <= args.drone_id <= 255:
-        parser.error("--drone-id must be between 0 and 255")
+        parser.error("--scale must be positive")
     return args
 
 
 def main() -> int:
     args = _parse_args()
-
     try:
         import cv2
         import numpy as np
     except ImportError:
-        print("Missing viewer dependencies. Install them with:\n"
-              "  python3 -m pip install -r 'laptop/requirements(1).txt'",
-              file=sys.stderr)
-        return 2
+        sys.exit("Missing dependencies: python3 -m pip install -r laptop/requirements.txt")
 
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    rx.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+    rx.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
     try:
-        rx.bind((args.bind, args.port))
+        rx.bind(("0.0.0.0", CAMERA_STREAM_PORT))
     except OSError as exc:
-        print(f"Cannot bind UDP {args.bind}:{args.port}: {exc}", file=sys.stderr)
-        return 2
-    rx.settimeout(0.05)
+        sys.exit(f"Cannot listen on UDP {CAMERA_STREAM_PORT}: {exc}")
+    rx.setblocking(False)
+    tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    target = (args.esp_ip, COMMAND_PORT)
+    keepalive = build_camera_stream_command(True, args.fps, args.quality)
 
-    control = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    control_target = ((args.esp_ip, args.command_port)
-                      if not args.listen_only else None)
-    enable_packet = build_camera_stream_command(True)
-    disable_packet = build_camera_stream_command(False)
+    asm = FrameAssembler()
+    window = "ESP32 camera"
+    size = (round(320 * args.scale), round(240 * args.scale))
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    cv2.imshow(window, np.zeros((size[1], size[0]), np.uint8))
+    print(f"Requesting {args.esp_ip}; q/Esc quits, s saves a frame.")
 
-    assembler = FrameAssembler()
-    window = "ESP32 camera preview"
-    next_keepalive = 0.0
-    last_frame_time: float | None = None
-    smoothed_fps = 0.0
-    completed_frames = 0
-    last_image = None
-
-    waiting = np.zeros((240, 640, 3), dtype=np.uint8)
-    cv2.putText(waiting, "Waiting for ESP32 camera stream...", (35, 105),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.72, (220, 220, 220), 2,
-                cv2.LINE_AA)
-    cv2.putText(waiting, f"UDP :{args.port}  |  q/Esc to quit", (35, 145),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 150, 150), 1,
-                cv2.LINE_AA)
-
-    try:
-        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-        cv2.imshow(window, waiting)
-    except cv2.error as exc:
-        print(f"OpenCV could not open a display window: {exc}", file=sys.stderr)
-        rx.close()
-        control.close()
-        return 2
-
-    target_text = (f"requesting {args.esp_ip}:{args.command_port}"
-                   if control_target else "listen-only")
-    print(f"Listening on UDP {args.bind}:{args.port}; {target_text}")
-    print("Press q/Escape to quit, or s to save the current frame.")
-
+    next_keepalive = stats_start = time.monotonic()
+    last_warning = float("-inf")
+    warned_version = False
+    shown = ages = latencies = 0
+    image = None
     try:
         while True:
             now = time.monotonic()
-            if control_target and now >= next_keepalive:
-                control.sendto(enable_packet, control_target)
-                next_keepalive = now + KEEPALIVE_INTERVAL_S
+            if now >= next_keepalive:
+                next_keepalive = now + KEEPALIVE_S
+                try:
+                    tx.sendto(keepalive, target)
+                except OSError as exc:        # e.g. drone off: keep trying
+                    if now - last_warning > 5:
+                        print(f"keepalive failed: {exc}", file=sys.stderr)
+                        last_warning = now
 
-            try:
-                data, source = rx.recvfrom(2048)
-            except socket.timeout:
-                data = None
-                source = None
+            select.select([rx], [], [], 0.005)
+            frame, _, bad_version = drain_socket(rx, asm, args.esp_ip)
+            if bad_version is not None and not warned_version:
+                warned_version = True
+                print(f"drone sends ECAM v{bad_version}, viewer expects "
+                      f"v{CAMERA_VERSION}: reflash the drone", file=sys.stderr)
+            if frame is not None:
+                gray = cv2.imdecode(np.frombuffer(frame.jpeg, np.uint8),
+                                    cv2.IMREAD_GRAYSCALE)
+                if gray is None:
+                    asm.dropped += 1
+                else:
+                    image = gray
+                    view = cv2.resize(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR),
+                                      size, interpolation=cv2.INTER_NEAREST)
+                    cv2.putText(view, f"#{frame.frame_id}  esp {frame.age_ms} ms  "
+                                f"drops {asm.dropped}/{frame.esp_drops}",
+                                (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                (0, 255, 0), 1, cv2.LINE_AA)
+                    cv2.imshow(window, view)
+                    shown += 1
+                    ages += frame.age_ms
+                    latencies += (time.monotonic() - frame.first_rx) * 1000
 
-            if data is not None:
-                chunk = parse_camera_chunk(data)
-                if (chunk is not None
-                        and (args.drone_id is None
-                             or chunk.drone_id == args.drone_id)):
-                    complete = assembler.add(chunk, source, now)
-                    if complete is not None:
-                        encoded = np.frombuffer(complete.jpeg, dtype=np.uint8)
-                        gray = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
-                        if gray is None:
-                            assembler.dropped_frames += 1
-                        else:
-                            completed_frames += 1
-                            if last_frame_time is not None:
-                                instant_fps = 1.0 / max(now - last_frame_time, 1e-6)
-                                smoothed_fps = (instant_fps if smoothed_fps == 0.0
-                                                else 0.8 * smoothed_fps
-                                                + 0.2 * instant_fps)
-                            last_frame_time = now
-                            last_image = gray
+            now = time.monotonic()
+            asm.expire(now)
+            if now - stats_start >= STATS_S:
+                n = max(shown, 1)
+                print(f"{shown / (now - stats_start):4.1f} fps  "
+                      f"esp age {ages / n:.0f} ms  laptop {latencies / n:.0f} ms  "
+                      f"drops {asm.dropped}")
+                stats_start, shown, ages, latencies = now, 0, 0, 0
 
-                            view = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                            status = (f"drone {complete.drone_id}  "
-                                      f"frame {complete.frame_id}  "
-                                      f"{smoothed_fps:.1f} fps  "
-                                      f"{len(complete.jpeg) / 1024:.1f} KiB  "
-                                      f"drops {assembler.dropped_frames}")
-                            cv2.putText(view, status, (6, 18),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                                        (0, 255, 0), 1, cv2.LINE_AA)
-                            if args.scale != 1.0:
-                                view = cv2.resize(
-                                    view, None, fx=args.scale, fy=args.scale,
-                                    interpolation=cv2.INTER_NEAREST)
-                            cv2.imshow(window, view)
-
-            assembler.expire(now)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
-            if key == ord("s") and last_image is not None:
-                args.save_dir.mkdir(parents=True, exist_ok=True)
-                stamp = time.strftime("%Y%m%d_%H%M%S")
-                path = args.save_dir / f"esp32_camera_{stamp}.jpg"
-                if cv2.imwrite(str(path), last_image):
-                    print(f"Saved {path}")
-                else:
-                    print(f"Could not save {path}", file=sys.stderr)
+            if key == ord("s") and image is not None:
+                path = time.strftime("esp32_camera_%Y%m%d_%H%M%S.png")
+                cv2.imwrite(path, image)
+                print(f"saved {path}")
     except KeyboardInterrupt:
         pass
     finally:
-        if control_target:
-            try:
-                control.sendto(disable_packet, control_target)
-            except OSError:
-                pass
-        rx.close()
-        control.close()
+        try:
+            tx.sendto(build_camera_stream_command(False), target)
+        except OSError:
+            pass
         cv2.destroyAllWindows()
-
-    print(f"Received {completed_frames} complete frames; "
-          f"dropped {assembler.dropped_frames} incomplete frames.")
     return 0
 
 

@@ -57,6 +57,9 @@ Dual-core FreeRTOS on ESP32-S3. Tasks are pinned to specific cores:
 | `nav_task` | 1 | 4 | 20 Hz | VFH obstacle avoidance, goal navigation, collision avoidance, WiFi killswitch |
 | `at_detect_task` | 1 | 1 | ~2 Hz | AprilTag detection via camera (tag16h5 family) |
 | `mission_task` | 1 | 2 | — | State machine: arm → takeoff → explore → precision land |
+| `camera_stream_task` | 0 | 1 | on demand | JPEG camera preview for `camera_stream.py` (started by `at_detect_task`) |
+
+**Camera**: two frame buffers (`fb_count=2`) shared by `at_detect_task` and `camera_stream_task`; both fetch via `camera_fb_get_fresh()` and return each buffer once. Internal RAM is tight: `esp-apriltag` allocates from PSRAM (`apriltag_psram_alloc.h`), and big buffers belong in PSRAM.
 
 **Setpoint ownership**: `mission_task` owns MAVLink setpoints during takeoff/landing. `nav_task` takes over when `nav_set_goal_ned()` is called. `nav_cancel()` returns ownership to mission.
 
@@ -72,7 +75,8 @@ Dual-core FreeRTOS on ESP32-S3. Tasks are pinned to specific cores:
 
 ### Laptop coordinator (`laptop/`)
 
-- `protocol.py` — packed struct definitions for the UDP wire format (telemetry and commands)
+- `protocol.py` — packed struct definitions for the UDP wire format (telemetry, commands, camera preview)
+- `camera_stream.py` — live camera viewer (`--esp-ip`, `--fps`, `--quality`)
 - `comms.py` — `CommsNode` class: UDP send/recv, drone IP discovery, nav-tag broadcast, peer position relay
 - `exploration.py` — `ExplorationDirector`: picks least-explored VFH gap, scores by crumb density + heading continuity + peer goal repulsion
 - `crumb_store.py` — breadcrumb trail storage (map frame), cone density queries
@@ -85,8 +89,10 @@ Dual-core FreeRTOS on ESP32-S3. Tasks are pinned to specific cores:
 
 UDP between ESP32 (port 5005 out, 5006 in) and laptop:
 - **Telemetry** (drone→laptop, 10 Hz): position, heading, nav state, VFH blocked bins, AprilTag sightings, breadcrumb batch
-- **Commands** (laptop→drone): `CMD_GOTO`, `CMD_LAND`, `CMD_HOLD`, `CMD_START`, `CMD_SET_NAV_TAGS`, `CMD_SET_PEERS`
+- **Commands** (laptop→drone): `CMD_GOTO`, `CMD_LAND`, `CMD_HOLD`, `CMD_START`, `CMD_SET_NAV_TAGS`, `CMD_SET_PEERS`, `CMD_CAMERA_STREAM` (1 Hz keepalive)
 - **ToF debug** (drone→laptop, port 5007): raw 8×8 front sensor frame
+- **AprilTag debug** (drone→laptop, port 5008): live detections + `proc_ms`
+- **Camera preview** (drone→laptop, port 5009): JPEG in 30-byte-header datagrams; `camera_stream.c` and `protocol.py` must match
 
 ## Key tuning constants
 
@@ -96,3 +102,4 @@ UDP between ESP32 (port 5005 out, 5006 in) and laptop:
 - `PEER_INJECT_RANGE_M` (4.0m), `PEER_DENSITY_MAX` (9.0) — peer avoidance in `nav_task.c`
 - `CRUISE_ALT_M` (0.5m) — mission altitude in `main.c`
 - Exploration params (goal distance, cone radius, heading weight) — in `setup.yaml`
+- `CONFIG_CAMERA_STREAM_DEFAULT_FPS` (10), `CONFIG_CAMERA_STREAM_DEFAULT_QUALITY` (60) — camera preview defaults (menuconfig)

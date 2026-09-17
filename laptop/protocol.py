@@ -6,6 +6,8 @@ Telemetry (ESP32 → laptop, 10 Hz):
 
 Command (laptop → ESP32, event-driven):
     Fixed 22-byte mission packet, plus variable-size control packets.
+
+Camera preview (ESP32 → laptop, port CAMERA_STREAM_PORT): see parse_camera_chunk().
 """
 
 import math
@@ -30,7 +32,7 @@ CMD_HOLD          = 0x03   # hold position, cancel goal
 CMD_SET_NAV_TAGS  = 0x04   # send navigation tag map positions to drone
 CMD_START         = 0x05   # arm and take off
 CMD_SET_PEERS     = 0x06   # update nearby drone positions for inter-drone avoidance
-CMD_CAMERA_STREAM = 0x07   # on-demand camera preview keepalive
+CMD_CAMERA_STREAM = 0x07   # camera preview keepalive
 
 VFH_BINS    = 32
 
@@ -212,72 +214,78 @@ def build_command(cmd: CommandPacket) -> bytes:
                        cmd.goal_x, cmd.goal_y, *tag_ids)
 
 
-def build_camera_stream_command(enabled: bool = True) -> bytes:
-    """Build the 3-byte camera-preview enable/keepalive command."""
-    return struct.pack("<BBB", PKT_CMD, CMD_CAMERA_STREAM, int(enabled))
+CAMERA_STREAM_MAX_FPS     = 15
+CAMERA_STREAM_MIN_QUALITY = 10
+CAMERA_STREAM_MAX_QUALITY = 90
 
 
-# ---------------------------------------------------------------------------
-# Camera JPEG chunk (drone → laptop, UDP port CAMERA_STREAM_PORT)
-# ---------------------------------------------------------------------------
+def build_camera_stream_command(enabled: bool = True, max_fps: int = 0,
+                                quality: int = 0) -> bytes:
+    """Keepalive, sent every second: pkt, cmd, enable, max_fps, quality.
 
+    0 means the firmware default.  The drone stops streaming 2.5 s after the
+    last enable packet, or at once on enabled=False.
+    """
+    if not 0 <= max_fps <= CAMERA_STREAM_MAX_FPS:
+        raise ValueError(f"fps must be 1-{CAMERA_STREAM_MAX_FPS}")
+    if quality and not CAMERA_STREAM_MIN_QUALITY <= quality <= CAMERA_STREAM_MAX_QUALITY:
+        raise ValueError(f"quality must be {CAMERA_STREAM_MIN_QUALITY}-"
+                         f"{CAMERA_STREAM_MAX_QUALITY}")
+    return struct.pack("<5B", PKT_CMD, CMD_CAMERA_STREAM, int(enabled),
+                       max_fps, quality)
+
+
+# One JPEG = data datagrams (header + payload) then an END datagram with no
+# payload and offset == frame_size.  Header layout: see main/camera_stream.c.
 CAMERA_MAGIC       = b"ECAM"
-CAMERA_VERSION     = 1
-CAMERA_FLAG_START  = 0x01
+CAMERA_VERSION     = 2
 CAMERA_FLAG_END    = 0x02
-
-# magic, version, flags, drone_id, reserved, frame_id, offset, frame_size,
-# width, height, payload_len.  Integers are little-endian like the rest of the
-# project's wire protocol.
-_CAMERA_HDR_FMT  = "<4sBBBBIIIHHH"
-_CAMERA_HDR_SIZE = struct.calcsize(_CAMERA_HDR_FMT)  # 26 bytes
+CAMERA_HEADER_FMT  = "<4sBBBBIIIHHHHH"
+CAMERA_HEADER_SIZE = struct.calcsize(CAMERA_HEADER_FMT)   # 30 bytes
 
 
 @dataclass
 class CameraChunk:
-    flags:        int
-    drone_id:     int
-    frame_id:     int
-    offset:       int
-    frame_size:   int
-    width:        int
-    height:       int
-    payload:      bytes
+    flags:      int
+    drone_id:   int
+    boot_nonce: int      # random per drone boot
+    frame_id:   int
+    offset:     int
+    frame_size: int      # END only
+    width:      int
+    height:     int
+    age_ms:     int      # capture -> this datagram sent, on the drone
+    esp_drops:  int      # frames the drone dropped since boot (wraps)
+    payload:    bytes
 
     @property
     def is_end(self) -> bool:
         return bool(self.flags & CAMERA_FLAG_END)
 
 
+def camera_packet_version(data: bytes) -> Optional[int]:
+    """Version byte of any ECAM datagram, else None (to report a mismatch)."""
+    return data[4] if len(data) >= 5 and data[:4] == CAMERA_MAGIC else None
+
+
 def parse_camera_chunk(data: bytes) -> Optional[CameraChunk]:
-    """Parse one camera UDP datagram. Returns None for malformed data."""
-    if len(data) < _CAMERA_HDR_SIZE:
+    """Parse one camera datagram; None if malformed or another version."""
+    if len(data) < CAMERA_HEADER_SIZE:
         return None
-
-    (magic, version, flags, drone_id, _reserved, frame_id, offset,
-     frame_size, width, height, payload_len) = struct.unpack_from(
-         _CAMERA_HDR_FMT, data, 0)
-
-    if magic != CAMERA_MAGIC or version != CAMERA_VERSION:
-        return None
-    if payload_len != len(data) - _CAMERA_HDR_SIZE:
+    (magic, version, flags, drone_id, nonce, frame_id, offset, frame_size,
+     width, height, payload_len, age_ms, esp_drops) = struct.unpack_from(
+        CAMERA_HEADER_FMT, data)
+    if (magic != CAMERA_MAGIC or version != CAMERA_VERSION
+            or payload_len != len(data) - CAMERA_HEADER_SIZE):
         return None
     if flags & CAMERA_FLAG_END:
-        if payload_len != 0 or frame_size == 0 or offset != frame_size:
+        if payload_len or not frame_size or offset != frame_size:
             return None
-    elif frame_size != 0:
+    elif frame_size or not payload_len:
         return None
-
-    return CameraChunk(
-        flags=flags,
-        drone_id=drone_id,
-        frame_id=frame_id,
-        offset=offset,
-        frame_size=frame_size,
-        width=width,
-        height=height,
-        payload=data[_CAMERA_HDR_SIZE:],
-    )
+    return CameraChunk(flags, drone_id, nonce, frame_id, offset, frame_size,
+                       width, height, age_ms, esp_drops,
+                       bytes(data[CAMERA_HEADER_SIZE:]))
 
 
 # ---------------------------------------------------------------------------
