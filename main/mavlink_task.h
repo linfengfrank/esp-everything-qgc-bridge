@@ -30,7 +30,8 @@
 
 // Hard cap for commanded translational speed from companion setpoints (m/s).
 // This is enforced in mavlink_set_velocity_* APIs before setpoints are sent.
-#define MAV_CMD_SPEED_CAP_MS 0.10f
+// Keep above the trajectory speed (0.3 m/s) so PX4 has margin to correct errors.
+#define MAV_CMD_SPEED_CAP_MS 0.50f
 
 // ---------------------------------------------------------------------------
 // Telemetry readback — written by mavlink_task, read by mission_task
@@ -88,6 +89,11 @@ void mavlink_set_velocity_xy_position_z(float vx, float vy, float z, float yaw);
 // Position hold: x/y/z in NED metres, yaw in radians (0 = North, CW+)
 // Unused velocity fields are sent as NaN automatically.
 void mavlink_set_position_ned(float x, float y, float z, float yaw);
+
+// Trajectory tracking: position + velocity feedforward (NED), yaw in radians.
+// Velocity is clamped to MAV_CMD_SPEED_CAP_MS.
+void mavlink_set_position_velocity_ned(float x, float y, float z,
+                                       float vx, float vy, float vz, float yaw);
 
 // Stop all motion — switches to position hold at current location.
 // Safe to call at any time; mavlink_task will use last known position.
