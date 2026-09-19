@@ -1,0 +1,16 @@
+# Conda environment for the laptop-side scripts (same packages as the pip route).
+#   conda env create -f laptop/environment.yml
+#   conda activate cde1302-laptop
+# requirements.txt stays the one package list: conda installs Python, pip
+# installs the rest from it.  After editing requirements.txt:
+#   conda env update -f laptop/environment.yml
+name: cde1302-laptop
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - pip
+  - pytest
+  - pip:
+      - -r requirements.txt

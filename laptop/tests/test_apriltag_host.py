@@ -5,7 +5,6 @@ code table as components/esp-apriltag, so the IDs here are the IDs the drone
 would report.
 """
 
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -32,7 +31,7 @@ from apriltag_host import (
 
 pytestmark = [
     pytest.mark.skipif(
-        shutil.which(os.environ.get("CC") or "cc") is None,
+        shutil.which(apriltag_host._compiler_name()) is None,
         reason="no C compiler: cannot build the host AprilTag library"),
     pytest.mark.skipif(
         not hasattr(cv2, "aruco") or not hasattr(cv2.aruco, "DICT_APRILTAG_16h5"),
@@ -135,6 +134,14 @@ def test_no_compiler_gives_an_actionable_error(monkeypatch):
     with pytest.raises(apriltag_host.ApriltagHostError) as exc:
         apriltag_host.library_path(rebuild=True)
     assert "no C compiler" in str(exc.value)
+
+
+def test_windows_refuses_visual_studio_cl(monkeypatch):
+    monkeypatch.setattr(apriltag_host.sys, "platform", "win32")
+    monkeypatch.setenv("CC", "cl.exe")
+    with pytest.raises(apriltag_host.ApriltagHostError) as exc:
+        apriltag_host._compiler()
+    assert "conda install -c conda-forge gcc" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

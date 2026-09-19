@@ -23,6 +23,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -101,9 +102,12 @@ _APRILTAG_DIR = _REPO / "components" / "esp-apriltag" / "apriltag"
 _SHIM = _HERE / "apriltag_host_shim.c"
 BUILD_DIR = _HERE / ".apriltag-host"
 
-_LIB_NAME = ("libapriltag_host.dylib" if sys.platform == "darwin"
-             else "libapriltag_host.so")
-_STAMP_NAME = "build.stamp"
+# One build per CPU architecture: an x86_64 Python (Intel conda under Rosetta)
+# and a native arm64 one can share a checkout, and dlopen refuses the other's.
+_ARCH = platform.machine() or "unknown"
+_LIB_EXT = {"darwin": ".dylib", "win32": ".dll"}.get(sys.platform, ".so")
+_LIB_NAME = f"libapriltag_host-{_ARCH}{_LIB_EXT}"
+_STAMP_NAME = f"build-{_ARCH}.stamp"
 
 _ABI_VERSION = 1        # must match ATH_ABI_VERSION in apriltag_host_shim.c
 
@@ -141,28 +145,57 @@ def _headers() -> list[Path]:
     return sorted(_APRILTAG_DIR.rglob("*.h"))
 
 
+# Windows builds with MinGW-w64 gcc, which always installs gcc.exe (conda-forge
+# `gcc`, MSYS2, WinLibs) but not always cc.exe.
+_DEFAULT_CC = "gcc" if sys.platform == "win32" else "cc"
+
+
+def _install_hint() -> str:
+    if sys.platform == "win32":
+        return ("install MinGW-w64 gcc into the conda environment "
+                "(conda install -c conda-forge gcc)")
+    if sys.platform == "darwin":
+        return "install the Xcode command line tools (xcode-select --install)"
+    return "install gcc (sudo apt install build-essential)"
+
+
 def _compiler_name() -> str:
     """What to compile with, unresolved: a cache hit then needs no PATH lookup,
     and a machine with no compiler can still use an already-built library."""
-    return os.environ.get("CC") or "cc"
+    return os.environ.get("CC") or _DEFAULT_CC
 
 
 def _compiler() -> str:
     cc = _compiler_name()
+    # conda-forge's c-compiler package sets CC to Visual Studio's cl.exe, which
+    # takes none of the gcc-style flags below.
+    if (sys.platform == "win32"
+            and Path(cc).stem.lower() in ("cl", "clang-cl")):
+        raise ApriltagHostError(
+            f"CC={cc!r} is Visual Studio's compiler, but laptop/apriltag_host.py "
+            f"builds with MinGW-w64 gcc.  Unset CC and {_install_hint()}.")
     found = shutil.which(cc)
     if found is None:
         raise ApriltagHostError(
-            f"no C compiler: {cc!r} is not on PATH.  Install the Xcode command "
-            "line tools (xcode-select --install) or set CC to a working "
-            "compiler; laptop/apriltag_host.py needs one to build the drone's "
-            "AprilTag detector for this machine.")
+            f"no C compiler: {cc!r} is not on PATH.  To build the drone's "
+            f"AprilTag detector for this machine, {_install_hint()}, or set "
+            "CC to a working compiler.")
     return found
 
 
 # -ffp-contract=off keeps the host from fusing multiply-adds, so margins and
 # poses stay comparable with the drone's.
-_CFLAGS = ["-O2", "-ffp-contract=off", "-shared", "-fPIC", "-w"]
-_LDFLAGS = ["-lm", "-lpthread"]
+if sys.platform == "win32":
+    # The AprilTag sources use Win32 threads here (common/pthreads_cross), so
+    # no -lpthread.  -static-libgcc is a guard: today's code needs nothing
+    # from libgcc_s_seh-1.dll, but if it ever does (popcount, int128, TLS),
+    # python.org's Python would not find that DLL, as Python 3.8+ no longer
+    # searches PATH for a DLL's dependencies.
+    _CFLAGS = ["-O2", "-ffp-contract=off", "-shared", "-w"]
+    _LDFLAGS = ["-static-libgcc", "-lm"]
+else:
+    _CFLAGS = ["-O2", "-ffp-contract=off", "-shared", "-fPIC", "-w"]
+    _LDFLAGS = ["-lm", "-lpthread"]
 
 
 def _build_args(out: Path) -> list[str]:
@@ -179,7 +212,7 @@ def _stamp(srcs: list[Path]) -> str:
     .h, still forces a rebuild.
     """
     h = hashlib.sha256()
-    h.update(f"abi{_ABI_VERSION}\n".encode())
+    h.update(f"abi{_ABI_VERSION} {sys.platform} {_ARCH}\n".encode())
     # The output path varies (temp file), so hash the flags, not the full line.
     h.update("\n".join([_compiler_name(), *_CFLAGS, *_LDFLAGS,
                         str(_APRILTAG_DIR)]).encode())
@@ -224,7 +257,12 @@ def library_path(rebuild: bool = False) -> Path:
                 f"(exit {proc.returncode}).\n"
                 f"  command: {' '.join(cmd)}\n"
                 f"  compiler output (last lines):\n{tail}")
-        os.replace(tmp, lib)
+        try:
+            os.replace(tmp, lib)
+        except PermissionError as exc:  # Windows won't replace a loaded DLL
+            raise ApriltagHostError(
+                f"cannot replace {lib} ({exc}); close any other tag_stream.py "
+                "or pytest using it and retry") from exc
     finally:
         tmp.unlink(missing_ok=True)
     stamp_file.write_text(want + "\n")
