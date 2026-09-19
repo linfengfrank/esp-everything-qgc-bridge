@@ -31,7 +31,9 @@ menu "Drone Configuration"
         string "IPV4 Address"
         default "192.168.1.100"
         help
-            Laptop/QGroundControl IPv4 address to which the drone sends data.
+            Laptop/QGroundControl IPv4 address to which the drone sends
+            MAVLink, telemetry, ToF debug, and its primary AprilTag debug
+            copy. Camera preview follows the latest viewer keepalive instead.
 
     config DRONE_STATIC_IPV4_ADDR
         string "Drone static IPv4 address"

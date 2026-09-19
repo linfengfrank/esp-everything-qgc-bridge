@@ -34,9 +34,12 @@ static volatile bool s_start_requested = false;
 static volatile bool s_wifi_connected  = false;
 static volatile bool s_camera_stream_requested = false;
 static volatile uint32_t s_camera_stream_keepalive_ms = 0;
+/* IPv4 address of the latest enabled camera keepalive sender, in network byte
+ * order.  One aligned word keeps the cross-task snapshot atomic. */
+static volatile uint32_t s_camera_stream_viewer_ipv4 = 0;
 
 /* Viewer-requested preview fps | quality << 8 (0 = firmware default), in one
- * word so the stream task on the other core reads a consistent pair. */
+ * word so the stream task reads a consistent pair. */
 static volatile uint32_t s_camera_stream_params = 0;
 
 /* Viewer refreshes its request once per second. */
@@ -242,23 +245,32 @@ static void handle_peers(const uint8_t *buf, int len)
     ESP_LOGD(TAG, "CMD_SET_PEERS: %d peers", count);
 }
 
-/* CMD_CAMERA_STREAM keepalive: pkt, cmd, enable [, max_fps, quality]. */
-static void handle_camera_stream(const uint8_t *buf, int len)
+/* CMD_CAMERA_STREAM keepalive: pkt, cmd, enable [, max_fps, quality].
+ * The sender becomes the preview destination.  An old viewer cannot turn off
+ * a newer viewer's stream when it exits. */
+static void handle_camera_stream(const uint8_t *buf, int len,
+                                 uint32_t source_ipv4)
 {
     if (len < 3) return;
     bool enable = buf[2] != 0;
     uint32_t params = (len >= 5) ? (buf[3] | (uint32_t)buf[4] << 8) : 0;
     bool changed = enable != wifi_camera_stream_enabled()
-                   || (enable && params != s_camera_stream_params);
+                   || (enable && (params != s_camera_stream_params
+                                  || source_ipv4 != s_camera_stream_viewer_ipv4));
 
     if (enable) {
         s_camera_stream_params = params;
+        s_camera_stream_viewer_ipv4 = source_ipv4;
         s_camera_stream_keepalive_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    } else if (source_ipv4 != s_camera_stream_viewer_ipv4) {
+        return;
     }
     s_camera_stream_requested = enable;
     if (changed && enable) {
-        ESP_LOGI(TAG, "Camera preview on (fps=%u q=%u, 0 = default)",
-                 (unsigned)(params & 0xFF), (unsigned)(params >> 8));
+        struct in_addr viewer = { .s_addr = source_ipv4 };
+        ESP_LOGI(TAG, "Camera preview -> %s (fps=%u q=%u, 0 = default)",
+                 inet_ntoa(viewer), (unsigned)(params & 0xFF),
+                 (unsigned)(params >> 8));
     } else if (changed) {
         ESP_LOGI(TAG, "Camera preview off");
     }
@@ -330,7 +342,9 @@ void wifi_task(void *arg)
     inet_aton(CONFIG_HOST_IPV4_ADDR, &tof_dest.sin_addr);
     connect(tof_sock, (struct sockaddr *)&tof_dest, sizeof(tof_dest));
 
-    /* AprilTag debug send socket */
+    /* AprilTag debug send socket.  These small packets always go to the
+     * configured host and are also copied to a remote active camera viewer,
+     * which gives tag_stream.py --detail its ESP overlay. */
     int at_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     configASSERT(at_sock >= 0);
     struct sockaddr_in at_dest = {
@@ -338,7 +352,6 @@ void wifi_task(void *arg)
         .sin_port   = htons(WIFI_AT_DEBUG_PORT),
     };
     inet_aton(CONFIG_HOST_IPV4_ADDR, &at_dest.sin_addr);
-    connect(at_sock, (struct sockaddr *)&at_dest, sizeof(at_dest));
 
     /* Command receive socket (non-blocking) */
     int rx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
@@ -365,14 +378,18 @@ void wifi_task(void *arg)
         {
             uint8_t cmd_buf[WIFI_CMD_BUF_SIZE];
             int len;
-            while ((len = recvfrom(rx_sock, cmd_buf, sizeof(cmd_buf), 0, NULL, NULL)) > 0) {
+            struct sockaddr_in source;
+            socklen_t source_len;
+            while (source_len = sizeof(source),
+                   (len = recvfrom(rx_sock, cmd_buf, sizeof(cmd_buf), 0,
+                                   (struct sockaddr *)&source, &source_len)) > 0) {
                 if (len < 2 || cmd_buf[0] != WIFI_PKT_CMD) continue;
                 if (cmd_buf[1] == CMD_TRAJ_DATA) {
                     handle_traj_data(cmd_buf, len);
                 } else if (cmd_buf[1] == CMD_TRAJ_START) {
                     handle_traj_start(cmd_buf, len);
                 } else if (cmd_buf[1] == CMD_CAMERA_STREAM) {
-                    handle_camera_stream(cmd_buf, len);
+                    handle_camera_stream(cmd_buf, len, source.sin_addr.s_addr);
                 } else if (cmd_buf[1] == CMD_SET_NAV_TAGS) {
                     handle_nav_tags(cmd_buf, len);
                 } else if (cmd_buf[1] == CMD_SET_PEERS) {
@@ -457,7 +474,18 @@ void wifi_task(void *arg)
             }
             size_t wire_len = sizeof(dbg)
                 - (size_t)(WIFI_AT_DEBUG_MAX - dbg.count) * sizeof(wifi_at_det_t);
-            send(at_sock, &dbg, wire_len, 0);
+            sendto(at_sock, &dbg, wire_len, 0,
+                   (const struct sockaddr *)&at_dest, sizeof(at_dest));
+
+            wifi_camera_stream_req_t preview;
+            if (wifi_camera_stream_get(&preview)
+                    && preview.viewer_ipv4 != at_dest.sin_addr.s_addr) {
+                struct sockaddr_in viewer_dest = at_dest;
+                viewer_dest.sin_addr.s_addr = preview.viewer_ipv4;
+                sendto(at_sock, &dbg, wire_len, 0,
+                       (const struct sockaddr *)&viewer_dest,
+                       sizeof(viewer_dest));
+            }
         }
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(100));   /* 10 Hz */
@@ -502,5 +530,6 @@ bool wifi_camera_stream_get(wifi_camera_stream_req_t *out)
     uint32_t params = s_camera_stream_params;
     out->max_fps = (uint8_t)params;
     out->quality = (uint8_t)(params >> 8);
+    out->viewer_ipv4 = s_camera_stream_viewer_ipv4;
     return wifi_camera_stream_enabled();
 }
