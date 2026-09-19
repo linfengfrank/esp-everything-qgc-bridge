@@ -141,6 +141,15 @@ class CommsNode:
         self._send_bytes(ip, build_command(cmd))
         return True
 
+    def send_raw(self, drone_id: int, data: bytes) -> bool:
+        """Send a pre-built packet to one drone.  Returns False if IP unknown."""
+        with self._lock:
+            ip = self._drone_ips.get(drone_id)
+        if ip is None:
+            return False
+        self._send_bytes(ip, data)
+        return True
+
     def send_all(self, cmd: CommandPacket) -> None:
         """Send the same command to every drone whose IP is known."""
         with self._lock:

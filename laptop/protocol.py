@@ -33,6 +33,8 @@ CMD_SET_NAV_TAGS  = 0x04   # send navigation tag map positions to drone
 CMD_START         = 0x05   # arm and take off
 CMD_SET_PEERS     = 0x06   # update nearby drone positions for inter-drone avoidance
 CMD_CAMERA_STREAM = 0x07   # camera preview keepalive
+CMD_TRAJ_DATA     = 0x08   # trajectory chunk upload
+CMD_TRAJ_START    = 0x09   # play the uploaded trajectory
 
 VFH_BINS    = 32
 
@@ -42,7 +44,7 @@ NAV_ROTATING   = 1
 NAV_FLYING     = 2
 NAV_ARRIVED    = 3
 NAV_STUCK      = 4
-NAV_RETREATING = 5
+NAV_TRAJ       = 5   # playing an uploaded trajectory
 
 NAV_STATE_NAMES = {
     NAV_IDLE:       "IDLE",
@@ -50,7 +52,7 @@ NAV_STATE_NAMES = {
     NAV_FLYING:     "FLYING",
     NAV_ARRIVED:    "ARRIVED",
     NAV_STUCK:      "STUCK",
-    NAV_RETREATING: "RETREATING",
+    NAV_TRAJ:       "TRAJ",
 }
 
 # ---------------------------------------------------------------------------
@@ -286,6 +288,37 @@ def parse_camera_chunk(data: bytes) -> Optional[CameraChunk]:
     return CameraChunk(flags, drone_id, nonce, frame_id, offset, frame_size,
                        width, height, age_ms, esp_drops,
                        bytes(data[CAMERA_HEADER_SIZE:]))
+
+
+# ---------------------------------------------------------------------------
+# Trajectory upload  (laptop → drone)
+#
+# The whole trajectory is uploaded before playback; the drone then plays it
+# on its own clock, so WiFi jitter cannot disturb the flight.
+# ---------------------------------------------------------------------------
+
+TRAJ_MAX_PTS   = 2400   # must match NAV_TRAJ_MAX_PTS in nav_task.h
+TRAJ_CHUNK_PTS = 80     # 8 + 80*12 = 968 B, fits WIFI_CMD_BUF_SIZE (1024)
+
+
+def build_traj_packets(traj_id: int, pts) -> list[bytes]:
+    """CMD_TRAJ_DATA chunks: pkt, cmd, id, total, offset, n, n x (x, y, z) f32.
+
+    pts: (x, y, z) NED offsets from the first point (m); traj_id: 1-255.
+    """
+    out = []
+    for off in range(0, len(pts), TRAJ_CHUNK_PTS):
+        chunk = pts[off:off + TRAJ_CHUNK_PTS]
+        buf = struct.pack("<BBBHHB", PKT_CMD, CMD_TRAJ_DATA, traj_id,
+                          len(pts), off, len(chunk))
+        buf += b"".join(struct.pack("<fff", *p) for p in chunk)
+        out.append(buf)
+    return out
+
+
+def build_traj_start(traj_id: int, dt_ms: int) -> bytes:
+    """CMD_TRAJ_START: play upload traj_id, one point every dt_ms."""
+    return struct.pack("<BBBH", PKT_CMD, CMD_TRAJ_START, traj_id, dt_ms)
 
 
 # ---------------------------------------------------------------------------
