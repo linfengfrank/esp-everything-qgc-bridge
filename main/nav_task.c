@@ -10,6 +10,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 
 #include <math.h>
 #include <string.h>
@@ -35,6 +36,17 @@ typedef struct {
 static nav_internal_t    s_nav;
 static nav_status_t      s_status;
 static SemaphoreHandle_t s_mutex;
+
+/* Uploaded trajectory. Only written while not playing (checked under s_mutex). */
+typedef struct { float x, y, z; } traj_pt_t;
+
+static traj_pt_t *s_traj;          /* PSRAM; offsets from first point, NaN x = not received */
+static uint16_t   s_traj_n;        /* points in the current upload                */
+static uint8_t    s_traj_id;       /* current upload id, 0 = none / already played */
+static uint16_t   s_traj_dt_ms;
+static float      s_traj_org[3];   /* odom position where playback started        */
+static float      s_traj_yaw;
+static int64_t    s_traj_t0_us;
 
 /* ---------------------------------------------------------------------------
  * Helpers
@@ -215,6 +227,43 @@ static bool collision_avoid(float goal_z)
 }
 
 /* ---------------------------------------------------------------------------
+ * Trajectory playback — linear interpolation between samples, with the
+ * segment velocity as feedforward so PX4 tracks without lag.
+ * --------------------------------------------------------------------------- */
+static void traj_tick(void)
+{
+    float k    = (float)(esp_timer_get_time() - s_traj_t0_us) / (1000.0f * s_traj_dt_ms);
+    int   last = s_traj_n - 1;
+
+    if (k >= (float)last) {
+        const traj_pt_t *p = &s_traj[last];
+        mavlink_set_position_ned(s_traj_org[0] + p->x, s_traj_org[1] + p->y,
+                                 s_traj_org[2] + p->z, s_traj_yaw);
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        if (s_nav.state == NAV_TRAJ) {
+            s_nav.state    = NAV_ARRIVED;
+            s_nav.has_goal = false;
+            s_status.state = NAV_ARRIVED;
+        }
+        xSemaphoreGive(s_mutex);
+        ESP_LOGI(TAG, "Trajectory done — holding last point");
+        return;
+    }
+
+    int   i  = (int)k;
+    float a  = k - (float)i;
+    float hz = 1000.0f / (float)s_traj_dt_ms;
+    const traj_pt_t *p0 = &s_traj[i], *p1 = &s_traj[i + 1];
+
+    mavlink_set_position_velocity_ned(
+        s_traj_org[0] + p0->x + a * (p1->x - p0->x),
+        s_traj_org[1] + p0->y + a * (p1->y - p0->y),
+        s_traj_org[2] + p0->z + a * (p1->z - p0->z),
+        (p1->x - p0->x) * hz, (p1->y - p0->y) * hz, (p1->z - p0->z) * hz,
+        s_traj_yaw);
+}
+
+/* ---------------------------------------------------------------------------
  * nav_tick — executed every 100 ms (10 Hz) by nav_task
  * --------------------------------------------------------------------------- */
 static void nav_tick(const vfh_config_t *vfh_cfg)
@@ -227,6 +276,11 @@ static void nav_tick(const vfh_config_t *vfh_cfg)
     /* --- Emergency collision avoidance (pre-empts everything, even idle) --- */
     float hold_z = nav.has_goal ? nav.goal_z : -0.5f;  /* fallback cruise alt */
     if (collision_avoid(hold_z)) return;
+
+    if (nav.state == NAV_TRAJ) {
+        traj_tick();
+        return;
+    }
 
     /* Nothing to do while idle */
     if (nav.state == NAV_IDLE || !nav.has_goal) return;
@@ -313,6 +367,9 @@ void nav_task_init(void)
     s_status.state = NAV_IDLE;
     s_mutex = xSemaphoreCreateMutex();
     configASSERT(s_mutex != NULL);
+
+    s_traj = heap_caps_calloc(NAV_TRAJ_MAX_PTS, sizeof(traj_pt_t), MALLOC_CAP_SPIRAM);
+    configASSERT(s_traj != NULL);
 }
 
 void nav_set_goal_map(float map_x, float map_y, float z)
@@ -343,6 +400,69 @@ void nav_cancel(void)
 
     mavlink_set_hold();
     ESP_LOGI(TAG, "Navigation cancelled — holding");
+}
+
+void nav_traj_put(uint8_t id, uint16_t total, uint16_t offset,
+                  const void *xyz, int n)
+{
+    if (id == 0 || total < 2 || total > NAV_TRAJ_MAX_PTS || n <= 0
+            || offset + n > total) {
+        ESP_LOGW(TAG, "Bad trajectory chunk (id=%u total=%u off=%u n=%d)",
+                 id, total, offset, n);
+        return;
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool playing = (s_nav.state == NAV_TRAJ);
+    if (!playing) {
+        if (id != s_traj_id || total != s_traj_n) {     /* new upload */
+            for (int i = 0; i < total; i++) s_traj[i].x = NAN;
+            s_traj_id = id;
+            s_traj_n  = total;
+        }
+        memcpy(&s_traj[offset], xyz, (size_t)n * sizeof(traj_pt_t));
+    }
+    xSemaphoreGive(s_mutex);
+
+    if (playing) ESP_LOGW(TAG, "Trajectory chunk ignored — playing");
+}
+
+void nav_traj_start(uint8_t id, uint16_t dt_ms)
+{
+    drone_state_t st = mavlink_get_state();
+    bool flying = st.armed && st.custom_main_mode == PX4_MAIN_MODE_OFFBOARD
+                  && mavlink_position_valid();
+    const char *err = NULL;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_nav.state == NAV_TRAJ)          err = "already playing";
+    else if (id == 0 || id != s_traj_id) err = "unknown upload id";
+    else if (dt_ms == 0)                 err = "dt_ms is 0";
+    else if (!flying)                    err = "not armed in OFFBOARD";
+    for (int i = 0; !err && i < s_traj_n; i++) {
+        if (isnan(s_traj[i].x)) err = "upload incomplete";
+    }
+    if (!err) {
+        s_traj_org[0] = st.x;
+        s_traj_org[1] = st.y;
+        s_traj_org[2] = st.z;
+        s_traj_yaw    = st.heading;
+        s_traj_dt_ms  = dt_ms;
+        s_traj_t0_us  = esp_timer_get_time();
+        s_traj_id     = 0;              /* consume: a repeated START cannot replay */
+        s_nav.state    = NAV_TRAJ;
+        s_nav.has_goal = true;
+        s_status.state = NAV_TRAJ;
+    }
+    uint16_t n = s_traj_n;
+    xSemaphoreGive(s_mutex);
+
+    if (err) {
+        ESP_LOGW(TAG, "Trajectory start refused: %s", err);
+    } else {
+        ESP_LOGI(TAG, "Trajectory start: %u pts @ %u ms from odom (%.2f, %.2f, %.2f)",
+                 n, dt_ms, st.x, st.y, st.z);
+    }
 }
 
 nav_status_t nav_get_status(void)

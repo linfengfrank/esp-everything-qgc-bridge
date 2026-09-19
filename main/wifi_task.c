@@ -264,6 +264,30 @@ static void handle_camera_stream(const uint8_t *buf, int len)
     }
 }
 
+/* CMD_TRAJ_DATA: pkt, cmd, id, total(u16), offset(u16), n, n × (x, y, z) float32 */
+static void handle_traj_data(const uint8_t *buf, int len)
+{
+    if (len < 8) return;
+    uint16_t total, offset;
+    memcpy(&total,  buf + 3, sizeof(total));
+    memcpy(&offset, buf + 5, sizeof(offset));
+    int n = buf[7];
+    if (len < 8 + n * 12) {
+        ESP_LOGW(TAG, "CMD_TRAJ_DATA truncated (%d < %d)", len, 8 + n * 12);
+        return;
+    }
+    nav_traj_put(buf[2], total, offset, buf + 8, n);
+}
+
+/* CMD_TRAJ_START: pkt, cmd, id, dt_ms(u16) */
+static void handle_traj_start(const uint8_t *buf, int len)
+{
+    if (len < 5) return;
+    uint16_t dt_ms;
+    memcpy(&dt_ms, buf + 3, sizeof(dt_ms));
+    nav_traj_start(buf[2], dt_ms);
+}
+
 wifi_peer_list_t wifi_get_peers(void)
 {
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
@@ -337,12 +361,17 @@ void wifi_task(void *arg)
     TickType_t last_wake = xTaskGetTickCount();
 
     while (1) {
-        /* ---- Check for incoming commands (non-blocking) ---- */
+        /* ---- Drain all queued commands (non-blocking) ---- */
         {
-            uint8_t cmd_buf[256];
-            int len = recvfrom(rx_sock, cmd_buf, sizeof(cmd_buf), 0, NULL, NULL);
-            if (len >= 2 && cmd_buf[0] == WIFI_PKT_CMD) {
-                if (cmd_buf[1] == CMD_CAMERA_STREAM) {
+            uint8_t cmd_buf[WIFI_CMD_BUF_SIZE];
+            int len;
+            while ((len = recvfrom(rx_sock, cmd_buf, sizeof(cmd_buf), 0, NULL, NULL)) > 0) {
+                if (len < 2 || cmd_buf[0] != WIFI_PKT_CMD) continue;
+                if (cmd_buf[1] == CMD_TRAJ_DATA) {
+                    handle_traj_data(cmd_buf, len);
+                } else if (cmd_buf[1] == CMD_TRAJ_START) {
+                    handle_traj_start(cmd_buf, len);
+                } else if (cmd_buf[1] == CMD_CAMERA_STREAM) {
                     handle_camera_stream(cmd_buf, len);
                 } else if (cmd_buf[1] == CMD_SET_NAV_TAGS) {
                     handle_nav_tags(cmd_buf, len);
