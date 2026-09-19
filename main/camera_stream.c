@@ -74,6 +74,7 @@ static uint8_t *s_image;               /* PSRAM copy of the frame being encoded 
 static uint8_t *s_packet;              /* PSRAM header + payload being sent */
 static uint8_t  s_boot_nonce;
 static uint16_t s_esp_drops;
+static uint32_t s_destination_ipv4;     /* network byte order; 0 = no viewer */
 static volatile bool s_active;
 
 /* ---------------------------------------------------------------------------
@@ -190,6 +191,24 @@ static int64_t period_us(int fps, int backoff)
     return MIN((1000000LL / fps) << backoff, MAX_PERIOD_US);
 }
 
+static bool set_destination(uint32_t ipv4)
+{
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(WIFI_CAMERA_STREAM_PORT),
+        .sin_addr.s_addr = ipv4,
+    };
+    if (ipv4 == 0 || connect(s_sock, (struct sockaddr *)&dest, sizeof(dest)) < 0) {
+        ESP_LOGW(TAG, "Cannot select preview destination (errno %d)", errno);
+        return false;
+    }
+
+    s_destination_ipv4 = ipv4;
+    ESP_LOGI(TAG, "Camera preview destination -> %s:%d",
+             inet_ntoa(dest.sin_addr), WIFI_CAMERA_STREAM_PORT);
+    return true;
+}
+
 static void camera_stream_task(void *arg)
 {
     (void)arg;
@@ -202,6 +221,11 @@ static void camera_stream_task(void *arg)
     for (;;) {
         wifi_camera_stream_req_t req;
         if (!wifi_camera_stream_get(&req)) {
+            vTaskDelay(pdMS_TO_TICKS(POLL_MS));
+            continue;
+        }
+        if (req.viewer_ipv4 != s_destination_ipv4
+                && !set_destination(req.viewer_ipv4)) {
             vTaskDelay(pdMS_TO_TICKS(POLL_MS));
             continue;
         }
@@ -281,10 +305,6 @@ static void camera_stream_task(void *arg)
 
 void camera_stream_start(void)
 {
-    struct sockaddr_in dest = {
-        .sin_family = AF_INET,
-        .sin_port   = htons(WIFI_CAMERA_STREAM_PORT),
-    };
     s_boot_nonce = esp_random() % 255 + 1;   /* WiFi is up: true RNG */
     s_image  = heap_caps_malloc(MAX_PIXELS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_packet = heap_caps_malloc(sizeof(header_t) + CHUNK_BYTES,
@@ -295,8 +315,6 @@ void camera_stream_start(void)
     /* The stack is in PSRAM too (internal RAM is tight), so this task must
      * never do flash operations (NVS, spi_flash). */
     if (s_image == NULL || s_packet == NULL || s_sock < 0
-            || inet_aton(CONFIG_HOST_IPV4_ADDR, &dest.sin_addr) == 0
-            || connect(s_sock, (struct sockaddr *)&dest, sizeof(dest)) < 0
             || xTaskCreatePinnedToCoreWithCaps(
                    camera_stream_task, "cam_stream", CAMERA_STREAM_TASK_STACK,
                    NULL, CAMERA_STREAM_TASK_PRIORITY, NULL,
@@ -309,7 +327,7 @@ void camera_stream_start(void)
         return;
     }
     s_active = true;
-    ESP_LOGI(TAG, "Camera preview ready -> %s:%d; internal heap %u B free",
-             CONFIG_HOST_IPV4_ADDR, WIFI_CAMERA_STREAM_PORT,
+    ESP_LOGI(TAG, "Camera preview ready; viewer selected by keepalive; "
+             "internal heap %u B free",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 }

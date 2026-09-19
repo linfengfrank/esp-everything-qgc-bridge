@@ -99,8 +99,8 @@ UDP between ESP32 (port 5005 out, 5006 in) and laptop:
 - **Telemetry** (drone→laptop, 10 Hz): position, heading, nav state, VFH blocked bins, AprilTag sightings, breadcrumb batch
 - **Commands** (laptop→drone): `CMD_GOTO`, `CMD_LAND`, `CMD_HOLD`, `CMD_START`, `CMD_SET_NAV_TAGS`, `CMD_SET_PEERS`, `CMD_CAMERA_STREAM` (1 Hz keepalive)
 - **ToF debug** (drone→laptop, port 5007): raw 8×8 front sensor frame
-- **AprilTag debug** (drone→laptop, port 5008): live detections + `proc_ms`
-- **Camera preview** (drone→laptop, port 5009): JPEG in 30-byte-header datagrams; `camera_stream.c` and `protocol.py` must match
+- **AprilTag debug** (drone→configured host and active remote camera viewer, port 5008): live detections + `proc_ms`
+- **Camera preview** (drone→latest keepalive sender, port 5009): JPEG in 30-byte-header datagrams; `camera_stream.c` and `protocol.py` must match
 
 ## Key tuning constants
 

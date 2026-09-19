@@ -147,14 +147,17 @@ Follow the conda steps above, with these changes:
 
 ### Laptop IP address
 
-The drones send telemetry and video only to `192.168.1.(100 + drone ID)`
-(set when flashing), so whichever laptop runs the scripts must hold that
-address on the drone Wi-Fi.
+The drones send MAVLink, telemetry and ToF debug data to
+`192.168.1.(100 + drone ID)` (set when flashing), so the QGroundControl or
+mission laptop must hold that address on the drone Wi-Fi. Camera video follows
+the source IP of the latest `camera_stream.py` or `tag_stream.py` keepalive and
+can therefore be viewed from another laptop on the same Wi-Fi. The small
+AprilTag debug stream is also copied to that viewer when `tag_stream.py` uses
+`--detail`.
 
 ## 3. ESP32 camera preview
 
-View a drone's camera over WiFi (drone IP = `192.168.1.(200 + drone ID)`;
-the laptop must be `CONFIG_HOST_IPV4_ADDR`):
+View a drone's camera over WiFi (drone IP = `192.168.1.(200 + drone ID)`):
 
 ```bash
 python3 laptop/camera_stream.py --esp-ip 192.168.1.222 [--fps 10] [--quality 60]
@@ -172,6 +175,12 @@ python3 laptop/tag_stream.py --esp-ip 192.168.1.222 [--detail]
 For both commands, `q`/Esc quits. The drone streams only while the viewer
 runs (~9 fps, ~130 ms from capture to the laptop on the OV3660). The overlay
 and the console show the drone-side frame age and dropped frames.
+
+Only one camera destination is active at a time: if viewers on two laptops
+send keepalives, the most recent keepalive wins. The Wi-Fi access point must
+allow client-to-client traffic, and the viewer firewall must allow Python to
+receive UDP 5008 and 5009. MAVLink remains on `CONFIG_HOST_IPV4_ADDR` while a
+different laptop is viewing the camera.
 
 ## 4. Fly from a CSV trajectory
 

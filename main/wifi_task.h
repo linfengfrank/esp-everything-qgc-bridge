@@ -193,11 +193,14 @@ bool wifi_is_connected(void);
  * automatically, so a crashed viewer cannot leave JPEG encoding enabled. */
 bool wifi_camera_stream_enabled(void);
 
-/* Latest preview request (0 = firmware default); returns
+/* Latest preview request (0 = firmware default).  viewer_ipv4 is the
+ * keepalive sender in network byte order, so the preview can follow a viewer
+ * on any laptop instead of CONFIG_HOST_IPV4_ADDR.  Returns
  * wifi_camera_stream_enabled(). */
 typedef struct {
     uint8_t max_fps;
     uint8_t quality;
+    uint32_t viewer_ipv4;
 } wifi_camera_stream_req_t;
 
 bool wifi_camera_stream_get(wifi_camera_stream_req_t *out);
