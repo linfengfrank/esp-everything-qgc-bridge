@@ -88,3 +88,11 @@ python3 laptop/tag_stream.py --esp-ip 192.168.1.222 [--detail]
 For both commands, `q`/Esc quits. The drone streams only while the viewer
 runs (~9 fps, ~130 ms from capture to the laptop on the OV3660). The overlay
 and the console show the drone-side frame age and dropped frames.
+
+## Fly a CSV trajectory
+
+```bash
+python3 laptop/send_trajectory.py --drone-id 22 --takeoff --trajectory trajectory/circle_traj.csv
+```
+
+See `trajectory/README.md` to generate the CSV and for the space it needs.

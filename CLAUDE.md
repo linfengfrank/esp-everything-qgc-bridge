@@ -42,6 +42,9 @@ python laptop/run_fleet_exploration.py
 
 # Live camera view with AprilTags detected and drawn on every frame
 python laptop/tag_stream.py --esp-ip 192.168.1.222
+
+# Fly a t,x,y,z (NED) CSV on one drone; trajectory/ holds the MATLAB generator
+python laptop/send_trajectory.py --drone-id 22 --takeoff --trajectory trajectory/circle_traj.csv
 ```
 
 Fleet configuration (drone IDs, start positions, arena bounds, nav tags) lives in `laptop/setup.yaml`.
