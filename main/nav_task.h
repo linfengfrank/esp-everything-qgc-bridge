@@ -25,6 +25,7 @@
 #define NAV_YAW_TOL_RAD         0.1f
 #define NAV_ARRIVE_RADIUS_M     0.25f   /* XY goal-reached radius (m)            */
 #define NAV_STUCK_HOLD_MS       3500    /* hold duration before declaring stuck   */
+#define NAV_TRAJ_MAX_PTS        2400    /* uploaded trajectory length (2 min at 20 Hz) */
 
 /* ---------------------------------------------------------------------------
  * Navigator states
@@ -35,6 +36,7 @@ typedef enum {
     NAV_FLYING,         /* aligned — flying forward at cruise speed              */
     NAV_ARRIVED,        /* within arrival radius — goal reached, hold commanded  */
     NAV_STUCK,          /* VFH fully blocked — holding, awaiting laptop rescue   */
+    NAV_TRAJ,           /* playing an uploaded trajectory                        */
 } nav_state_t;
 
 /* ---------------------------------------------------------------------------
@@ -77,6 +79,17 @@ void nav_set_goal_map(float map_x, float map_y, float z);
 
 /* Cancel navigation — transitions to NAV_IDLE and commands position hold. */
 void nav_cancel(void);
+
+/* Store points [offset, offset+n) of trajectory upload `id` (`total` points).
+ * xyz: n × (x, y, z) float32, NED offsets from the first point (m).
+ * A new id or total starts a new upload. Ignored while a trajectory plays. */
+void nav_traj_put(uint8_t id, uint16_t total, uint16_t offset,
+                  const void *xyz, int n);
+
+/* Play upload `id` from the current position, one point every dt_ms,
+ * holding the current heading. Refused unless the upload is complete and the
+ * drone is armed in OFFBOARD. Each upload plays once. Ends in NAV_ARRIVED. */
+void nav_traj_start(uint8_t id, uint16_t dt_ms);
 
 /* Thread-safe status snapshot. */
 nav_status_t nav_get_status(void);

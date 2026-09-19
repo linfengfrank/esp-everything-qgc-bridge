@@ -1,139 +1,162 @@
 #!/usr/bin/env python3
 """
-Send a trajectory file to one UAV as a sequence of CMD_GOTO commands.
+Fly a CSV trajectory smoothly on one drone.
 
-Supported trajectory file formats:
-  1) CSV with two columns: x,y
-  2) Plain text with one point per line: x y
+The whole trajectory is uploaded first; the ESP32 then plays it on its own
+20 Hz clock (position + velocity feedforward to PX4), so WiFi latency and
+jitter cannot disturb the flight.
+
+CSV: columns t,x,y,z (s, NED m); a header row and '#' comments are allowed.
+The trajectory is flown relative to where the drone hovers when it starts.
 
 Example:
-    python laptop/send_trajectory.py --config laptop/setup.yaml --drone-id 0 --trajectory my_path.txt --delay 1.0
+    python3 laptop/send_trajectory.py --drone-id 2 --takeoff \
+        --trajectory trajectory/circle_traj.csv
 """
 
 import argparse
-import csv
 import logging
-import sys
+import random
 import time
 from pathlib import Path
 
+import numpy as np
+
 from comms import CommsNode
-from protocol import CMD_GOTO, CommandPacket
+from protocol import (
+    CMD_HOLD,
+    CMD_LAND,
+    CMD_START,
+    NAV_TRAJ,
+    TRAJ_MAX_PTS,
+    CommandPacket,
+    build_traj_packets,
+    build_traj_start,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("send_trajectory")
+
+UPLOAD_GAP_S = 0.025   # ESP drains commands at 10 Hz from a 6-packet UDP queue
 
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-log = logging.getLogger("trajectory_sender")
-
-
-def load_trajectory(path: str | Path) -> list[tuple[float, float]]:
-    """Load waypoints from a CSV or plain-text trajectory file."""
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"trajectory file not found: {p}")
-
-    pts: list[tuple[float, float]] = []
-
-    if p.suffix.lower() == ".csv":
-        with p.open("r", newline="") as fh:
-            reader = csv.reader(fh)
-            for row_num, row in enumerate(reader, 1):
-                if not row or not row[0].strip() or row[0].lstrip().startswith("#"):
-                    continue
-                if len(row) < 2:
-                    raise ValueError(f"bad CSV row {row_num}: expected x,y")
-                try:
-                    x = float(row[0])
-                    y = float(row[1])
-                except ValueError as exc:
-                    raise ValueError(f"bad numeric value at row {row_num}") from exc
-                pts.append((x, y))
-    else:
-        with p.open("r") as fh:
-            for line_num, line in enumerate(fh, 1):
-                line = line.split("#", 1)[0].strip()
-                if not line:
-                    continue
-                parts = line.replace(",", " ").split()
-                if len(parts) < 2:
-                    raise ValueError(f"bad trajectory line {line_num}: expected x y")
-                try:
-                    x = float(parts[0])
-                    y = float(parts[1])
-                except ValueError as exc:
-                    raise ValueError(f"bad numeric value at line {line_num}") from exc
-                pts.append((x, y))
-
-    if not pts:
-        raise ValueError(f"trajectory file contains no valid points: {p}")
-    return pts
-
-
-def wait_for_drone(comms: CommsNode, drone_id: int, timeout_s: float) -> None:
-    """Block until the drone has spoken and its IP is known."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if drone_id in comms.known_drones():
-            return
-        time.sleep(0.2)
-
-    if drone_id not in comms.known_drones():
-        raise RuntimeError(
-            f"drone {drone_id} did not appear on the telemetry channel within {timeout_s:.1f}s"
-        )
-
-
-def send_trajectory(
-    comms: CommsNode,
-    drone_id: int,
-    trajectory: list[tuple[float, float]],
-    delay_s: float = 1.0,
-    wait_for_drone_s: float = 10.0,
-) -> None:
-    """Send all waypoints to the drone as repeated CMD_GOTO packets."""
-    if not trajectory:
-        raise ValueError("trajectory is empty")
-
-    wait_for_drone(comms, drone_id, wait_for_drone_s)
-
-    for idx, (x, y) in enumerate(trajectory, 1):
-        log.info("sending point %d/%d to drone %d -> (%.3f, %.3f)", idx, len(trajectory), drone_id, x, y)
-        ok = comms.send_command(drone_id, CommandPacket(CMD_GOTO, goal_x=x, goal_y=y))
-        if not ok:
-            raise RuntimeError(f"failed to send point {idx}/{len(trajectory)} to drone {drone_id}")
-
-        if idx < len(trajectory) and delay_s > 0:
-            time.sleep(delay_s)
+def load_trajectory(path: str, dt: float) -> np.ndarray:
+    """Read t,x,y,z, resample every dt, return offsets from the first point."""
+    data = np.atleast_2d(np.genfromtxt(path, delimiter=",", comments="#"))
+    data = data[~np.isnan(data).any(axis=1)]           # drops the header row
+    if data.shape[0] < 2 or data.shape[1] < 4:
+        raise SystemExit(f"{path}: need at least 2 rows of t,x,y,z")
+    t = data[:, 0]
+    if np.any(np.diff(t) <= 0):
+        raise SystemExit(f"{path}: time column must be strictly increasing")
+    tq = np.arange(t[0], t[-1] + 1e-9, dt)
+    pts = np.column_stack([np.interp(tq, t, data[:, c]) for c in (1, 2, 3)])
+    return pts - pts[0]
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Upload a trajectory file to one UAV")
-    parser.add_argument("--config", default="laptop/setup.yaml", help="Path to the GCS config YAML")
-    parser.add_argument("--drone-id", type=int, required=True, help="Drone ID to target")
-    parser.add_argument("--trajectory", required=True, help="Path to the trajectory file")
-    parser.add_argument("--delay", type=float, default=1.0, help="Delay between waypoints in seconds")
-    parser.add_argument("--telem-port", type=int, default=5005, help="Telemetry listen port")
-    parser.add_argument("--cmd-port", type=int, default=5006, help="Command send port")
-    parser.add_argument("--wait-for-drone-s", type=float, default=10.0, help="How long to wait for drone telemetry")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Upload a CSV trajectory to one drone and fly it")
+    ap.add_argument("--drone-id", type=int, required=True)
+    ap.add_argument("--trajectory", required=True, help="CSV with columns t,x,y,z (s, NED m)")
+    ap.add_argument("--config", default="laptop/setup.yaml", help="Fleet config (optional)")
+    ap.add_argument("--dt", type=float, default=0.05,
+                    help="Upload sample period (s); 0.05 = ESP nav loop rate")
+    ap.add_argument("--max-speed", type=float, default=0.30,
+                    help="Refuse faster trajectories (m/s); keep below MAV_CMD_SPEED_CAP_MS")
+    ap.add_argument("--takeoff", action="store_true", help="Send CMD_START (arm + take off) first")
+    ap.add_argument("--takeoff-wait", type=float, default=8.0,
+                    help="Seconds from CMD_START to trajectory upload")
+    ap.add_argument("--finish", choices=["land", "hold"], default="land",
+                    help="Action after the trajectory")
+    ap.add_argument("--telem-port", type=int, default=5005)
+    ap.add_argument("--cmd-port", type=int, default=5006)
+    args = ap.parse_args()
 
-    trajectory = load_trajectory(args.trajectory)
-    log.info("loaded %d waypoints from %s", len(trajectory), args.trajectory)
+    dt_ms = round(args.dt * 1000)
+    if not 1 <= dt_ms <= 1000:
+        raise SystemExit("--dt must be 0.001-1.0 s")
+    pts = load_trajectory(args.trajectory, dt_ms / 1000)
+    duration = (len(pts) - 1) * dt_ms / 1000
+    vmax = np.linalg.norm(np.diff(pts, axis=0), axis=1).max() * 1000 / dt_ms
+    log.info("%s: %d points, %.1f s, max speed %.3f m/s",
+             args.trajectory, len(pts), duration, vmax)
+    if vmax > args.max_speed + 1e-6:
+        raise SystemExit(f"max speed {vmax:.3f} m/s exceeds --max-speed {args.max_speed} m/s")
+    if len(pts) > TRAJ_MAX_PTS:
+        raise SystemExit(f"{len(pts)} points > {TRAJ_MAX_PTS}; use a larger --dt or a shorter trajectory")
+
+    latest = {}
+
+    def on_telemetry(pkt, _ip):
+        if pkt.drone_id == args.drone_id:
+            latest["pkt"] = pkt
+
+    def wait_for(cond, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if "pkt" in latest and cond(latest["pkt"]):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def send(cmd_type: int, name: str) -> None:
+        if not comms.send_command(args.drone_id, CommandPacket(cmd_type)):
+            raise RuntimeError(f"{name} not sent: drone {args.drone_id} IP unknown")
+        log.info("%s sent", name)
 
     comms = CommsNode(
         listen_port=args.telem_port,
         cmd_port=args.cmd_port,
-        config_path=args.config,
+        config_path=args.config if Path(args.config).exists() else None,
     )
+    comms.on_telemetry(on_telemetry)
     comms.start()
+    flying = not args.takeoff   # without --takeoff the drone must already hover
     try:
-        send_trajectory(
-            comms,
-            drone_id=args.drone_id,
-            trajectory=trajectory,
-            delay_s=args.delay,
-            wait_for_drone_s=args.wait_for_drone_s,
-        )
-        log.info("trajectory upload complete")
+        if not wait_for(lambda p: True, 30.0):
+            raise RuntimeError(f"no telemetry from drone {args.drone_id}")
+
+        if args.takeoff:
+            send(CMD_START, "CMD_START")
+            flying = True
+            time.sleep(args.takeoff_wait)
+
+        # Upload, then start; retry if the drone did not switch to TRAJ.
+        traj_id = random.randint(1, 255)
+        packets = build_traj_packets(traj_id, pts)
+        start = build_traj_start(traj_id, dt_ms)
+        for attempt in range(1, 6):
+            for p in packets:
+                comms.send_raw(args.drone_id, p)
+                time.sleep(UPLOAD_GAP_S)
+            comms.send_raw(args.drone_id, start)
+            if wait_for(lambda p: p.nav_state == NAV_TRAJ, 1.5):
+                break
+            log.warning("attempt %d: trajectory not started (see ESP log)", attempt)
+        else:
+            raise RuntimeError("drone refused the trajectory")
+
+        log.info("playing trajectory %d (%.1f s)", traj_id, duration)
+        end = time.monotonic() + duration + 10.0
+        while latest["pkt"].nav_state == NAV_TRAJ and time.monotonic() < end:
+            p = latest["pkt"]
+            log.info("pos (%.2f, %.2f)", p.ned_x, p.ned_y)
+            time.sleep(1.0)
+        log.info("trajectory ended, nav state %s", latest["pkt"].nav_state_name)
+
+        if args.finish == "land":
+            send(CMD_LAND, "CMD_LAND")
+        else:
+            send(CMD_HOLD, "CMD_HOLD")
+    except (Exception, KeyboardInterrupt):
+        if flying:
+            log.error("aborted — sending CMD_LAND")
+            comms.send_command(args.drone_id, CommandPacket(CMD_LAND))
+        raise
     finally:
         comms.stop()
 

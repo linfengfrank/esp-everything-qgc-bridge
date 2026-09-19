@@ -98,6 +98,9 @@ void camera_to_ned(float tx, float ty, float tz,
 #endif
 
 #include "esp_camera.h"
+#include "esp_heap_caps.h"
+#include "camera_stream.h"
+#include "wifi_task.h"
 
 #define CAMERA_MODEL_XIAO_ESP32S3
 
@@ -152,7 +155,11 @@ static camera_config_t camera_config = {
     .frame_size = FRAMESIZE_QVGA,    //QQVGA-UXGA Do not use sizes above QVGA when not JPEG
 
     // .jpeg_quality = 12, //0-63 lower number means higher quality
-    .fb_count = 1,       //if more than one, i2s runs in continuous mode. Use only with JPEG
+    /* Two buffers keep the driver capturing while one is held, so a frame is
+     * usually ready at once: the preview runs at the sensor rate (~9 fps on
+     * the OV3660) instead of ~4 fps with one buffer.  ("JPEG only" upstream
+     * is just a note; grayscale QVGA works.) */
+    .fb_count = 2,
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_LATEST,
 };
@@ -185,6 +192,10 @@ static esp_err_t init_camera(void)
  * short: detection time dominates the loop period, and this delay adds
  * directly to tag-detection latency. */
 #define LOOP_DELAY_MS 20
+
+/* While the preview is on, detect on a copy so the camera buffer goes back
+ * at once and the stream task is not left with a single buffer. */
+#define AT_FRAME_COPY_BYTES (320 * 240)
 
 static volatile bool  s_land_requested = false;
 static volatile int   s_last_tag_id = -1;
@@ -294,21 +305,11 @@ void at_detect_task(void* pvParams)
     if(ESP_OK != init_camera()) {
         return;
     }
-    // Socket setup
 
-    // int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    // if (sock < 0){
-    //   ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-    //   return;
-    // }
-
-    // int opt = 1;
-    // setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    // const struct sockaddr_in target_addr = {
-    //   .sin_addr.s_addr = inet_addr(CONFIG_HOST_IPV4_ADDR),
-    //   .sin_family      = AF_INET,
-    //   .sin_port        = htons(CONFIG_APRILTAG_SEND_PORT),
-    // };
+    /* NULL: always detect on the camera buffer (the preview just slows). */
+    uint8_t *frame_copy = heap_caps_malloc(AT_FRAME_COPY_BYTES,
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    camera_stream_start();
 
     // Create tag family object
     apriltag_family_t *tf = tag16h5_create();
@@ -337,7 +338,9 @@ void at_detect_task(void* pvParams)
 
     while (1)
     {
-        camera_fb_t *pic = esp_camera_fb_get();
+        /* Detections are paired with the pose read after detection, so a
+         * frame left queued during the last detection must not be used. */
+        camera_fb_t *pic = camera_fb_get_fresh();
       if (pic == NULL) {
         ESP_LOGW(TAG, "Camera frame grab failed");
         vTaskDelay(pdMS_TO_TICKS(LOOP_DELAY_MS));
@@ -352,6 +355,18 @@ void at_detect_task(void* pvParams)
           .stride = pic->width,
           .buf    = pic->buf
         };
+
+        /* Preview on: detect on a copy and give the buffer back now. */
+        size_t pixels = (size_t)pic->width * pic->height;
+        if (camera_stream_active() && wifi_camera_stream_enabled()
+                && frame_copy != NULL
+                && pic->format == PIXFORMAT_GRAYSCALE
+                && pixels <= AT_FRAME_COPY_BYTES && pic->len >= pixels) {
+          memcpy(frame_copy, pic->buf, pixels);
+          at_im.buf = frame_copy;
+          esp_camera_fb_return(pic);
+          pic = NULL;
+        }
 
         // Testing responsiveness of camera
         // print_img(&at_im);
@@ -495,7 +510,9 @@ void at_detect_task(void* pvParams)
         // cleanup
         apriltag_detections_destroy(at_detections);
 
-        esp_camera_fb_return(pic);
+        if (pic != NULL) {
+          esp_camera_fb_return(pic);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(LOOP_DELAY_MS));
     }

@@ -8,15 +8,19 @@ Autonomous drone swarm system for the SAFMC 2026 Cat Swarm Challenge. An ESP32-S
 
 ## Build & Flash (ESP-IDF)
 
-```bash
-# First time: clone MAVLink C library
-cd components/mavlink/include && git clone --depth 1 https://github.com/mavlink/c_library_v2.git . && cd -
+ESP-IDF is the only external dependency; everything else (MAVLink c_library_v2,
+esp-apriltag, VL53L5CX, managed_components/) is committed in-tree. The pinned
+ESP-IDF version lives in `tools/idf-pin.env`.
 
+```bash
 # Build
 idf.py build
 
 # Flash and monitor (adjust port as needed)
 idf.py -p /dev/ttyUSB0 flash monitor
+
+# Per-drone build+flash (pins CONFIG_DRONE_ID + host IP, restores sdkconfig after)
+./flash_drone.sh 22 /dev/tty.usbmodem2101
 
 # Per-drone config (drone ID, GPIO pins, WiFi, front sensor index)
 idf.py menuconfig   # under "Drone Configuration"
@@ -24,7 +28,7 @@ idf.py menuconfig   # under "Drone Configuration"
 
 ## Laptop-side scripts
 
-Run from the `laptop/` directory. Requires Python 3.10+ with `pyyaml` and `matplotlib`.
+Run from the `laptop/` directory. Requires Python 3.10+: `python3 -m pip install -r laptop/requirements.txt`.
 
 ```bash
 # Full mission (exploration + relay phases, interactive prompts)
@@ -35,6 +39,12 @@ python laptop/run_exploration.py
 
 # Fleet exploration (multiple drones, no relay)
 python laptop/run_fleet_exploration.py
+
+# Live camera view with AprilTags detected and drawn on every frame
+python laptop/tag_stream.py --esp-ip 192.168.1.222
+
+# Fly a t,x,y,z (NED) CSV on one drone; trajectory/ holds the MATLAB generator
+python laptop/send_trajectory.py --drone-id 22 --takeoff --trajectory trajectory/circle_traj.csv
 ```
 
 Fleet configuration (drone IDs, start positions, arena bounds, nav tags) lives in `laptop/setup.yaml`.
@@ -53,6 +63,9 @@ Dual-core FreeRTOS on ESP32-S3. Tasks are pinned to specific cores:
 | `nav_task` | 1 | 4 | 20 Hz | VFH obstacle avoidance, goal navigation, collision avoidance, WiFi killswitch |
 | `at_detect_task` | 1 | 1 | ~2 Hz | AprilTag detection via camera (tag16h5 family) |
 | `mission_task` | 1 | 2 | — | State machine: arm → takeoff → explore → precision land |
+| `camera_stream_task` | 0 | 1 | on demand | JPEG camera preview for `camera_stream.py` (started by `at_detect_task`) |
+
+**Camera**: two frame buffers (`fb_count=2`) shared by `at_detect_task` and `camera_stream_task`; both fetch via `camera_fb_get_fresh()` and return each buffer once. Internal RAM is tight: `esp-apriltag` allocates from PSRAM (`apriltag_psram_alloc.h`), and big buffers belong in PSRAM. `laptop/tag_stream.py` compiles the same `esp-apriltag` sources for the laptop so its overlay matches what the drone decodes; keep `at_detect.c`'s parameters and gate in sync with `laptop/apriltag_host.py`.
 
 **Setpoint ownership**: `mission_task` owns MAVLink setpoints during takeoff/landing. `nav_task` takes over when `nav_set_goal_ned()` is called. `nav_cancel()` returns ownership to mission.
 
@@ -68,7 +81,10 @@ Dual-core FreeRTOS on ESP32-S3. Tasks are pinned to specific cores:
 
 ### Laptop coordinator (`laptop/`)
 
-- `protocol.py` — packed struct definitions for the UDP wire format (telemetry and commands)
+- `protocol.py` — packed struct definitions for the UDP wire format (telemetry, commands, camera preview)
+- `camera_stream.py` — live camera viewer (`--esp-ip`, `--fps`, `--quality`)
+- `apriltag_host.py` + `apriltag_host_shim.c` — ctypes binding to `components/esp-apriltag` compiled for the laptop (cached in `laptop/.apriltag-host/`), so laptop-side detections carry firmware semantics: same code table, same decision-margin scale (3.4.5 computes it after `decode_sharpening`; a pip AprilTag does not), same gate, same pose
+- `tag_stream.py` — `camera_stream.py` plus AprilTags: detects on every frame with `apriltag_host.py` and draws an outline + id per tag; `--detail` adds the gate's rejects, the HUD and the drone's own `:5008` detections, which lag the video by ~1 s
 - `comms.py` — `CommsNode` class: UDP send/recv, drone IP discovery, nav-tag broadcast, peer position relay
 - `exploration.py` — `ExplorationDirector`: picks least-explored VFH gap, scores by crumb density + heading continuity + peer goal repulsion
 - `crumb_store.py` — breadcrumb trail storage (map frame), cone density queries
@@ -81,8 +97,10 @@ Dual-core FreeRTOS on ESP32-S3. Tasks are pinned to specific cores:
 
 UDP between ESP32 (port 5005 out, 5006 in) and laptop:
 - **Telemetry** (drone→laptop, 10 Hz): position, heading, nav state, VFH blocked bins, AprilTag sightings, breadcrumb batch
-- **Commands** (laptop→drone): `CMD_GOTO`, `CMD_LAND`, `CMD_HOLD`, `CMD_START`, `CMD_SET_NAV_TAGS`, `CMD_SET_PEERS`
+- **Commands** (laptop→drone): `CMD_GOTO`, `CMD_LAND`, `CMD_HOLD`, `CMD_START`, `CMD_SET_NAV_TAGS`, `CMD_SET_PEERS`, `CMD_CAMERA_STREAM` (1 Hz keepalive)
 - **ToF debug** (drone→laptop, port 5007): raw 8×8 front sensor frame
+- **AprilTag debug** (drone→laptop, port 5008): live detections + `proc_ms`
+- **Camera preview** (drone→laptop, port 5009): JPEG in 30-byte-header datagrams; `camera_stream.c` and `protocol.py` must match
 
 ## Key tuning constants
 
@@ -92,3 +110,4 @@ UDP between ESP32 (port 5005 out, 5006 in) and laptop:
 - `PEER_INJECT_RANGE_M` (4.0m), `PEER_DENSITY_MAX` (9.0) — peer avoidance in `nav_task.c`
 - `CRUISE_ALT_M` (0.5m) — mission altitude in `main.c`
 - Exploration params (goal distance, cone radius, heading weight) — in `setup.yaml`
+- `CONFIG_CAMERA_STREAM_DEFAULT_FPS` (10), `CONFIG_CAMERA_STREAM_DEFAULT_QUALITY` (60) — camera preview defaults (menuconfig)

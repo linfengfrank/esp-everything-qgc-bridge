@@ -5,7 +5,9 @@ Telemetry (ESP32 → laptop, 10 Hz):
     Fixed-size packet.
 
 Command (laptop → ESP32, event-driven):
-    Fixed 18-byte packet.
+    Fixed 22-byte mission packet, plus variable-size control packets.
+
+Camera preview (ESP32 → laptop, port CAMERA_STREAM_PORT): see parse_camera_chunk().
 """
 
 import math
@@ -22,6 +24,7 @@ PKT_CMD       = 0x02   # command to drone
 PKT_AT_DEBUG  = 0x04   # live AprilTag detections (debug stream)
 
 AT_DEBUG_PORT = 5008   # UDP port the AprilTag debug stream arrives on
+CAMERA_STREAM_PORT = 5009
 
 CMD_GOTO          = 0x01   # navigate to (goal_x, goal_y)
 CMD_LAND          = 0x02   # land immediately
@@ -29,6 +32,9 @@ CMD_HOLD          = 0x03   # hold position, cancel goal
 CMD_SET_NAV_TAGS  = 0x04   # send navigation tag map positions to drone
 CMD_START         = 0x05   # arm and take off
 CMD_SET_PEERS     = 0x06   # update nearby drone positions for inter-drone avoidance
+CMD_CAMERA_STREAM = 0x07   # camera preview keepalive
+CMD_TRAJ_DATA     = 0x08   # trajectory chunk upload
+CMD_TRAJ_START    = 0x09   # play the uploaded trajectory
 
 VFH_BINS    = 32
 
@@ -38,7 +44,7 @@ NAV_ROTATING   = 1
 NAV_FLYING     = 2
 NAV_ARRIVED    = 3
 NAV_STUCK      = 4
-NAV_RETREATING = 5
+NAV_TRAJ       = 5   # playing an uploaded trajectory
 
 NAV_STATE_NAMES = {
     NAV_IDLE:       "IDLE",
@@ -46,7 +52,7 @@ NAV_STATE_NAMES = {
     NAV_FLYING:     "FLYING",
     NAV_ARRIVED:    "ARRIVED",
     NAV_STUCK:      "STUCK",
-    NAV_RETREATING: "RETREATING",
+    NAV_TRAJ:       "TRAJ",
 }
 
 # ---------------------------------------------------------------------------
@@ -208,6 +214,111 @@ def build_command(cmd: CommandPacket) -> bytes:
     tag_ids = (cmd.found_tag_ids + [-1] * MAX_FOUND_TAGS)[:MAX_FOUND_TAGS]
     return struct.pack(_CMD_FMT, PKT_CMD, cmd.cmd_type,
                        cmd.goal_x, cmd.goal_y, *tag_ids)
+
+
+CAMERA_STREAM_MAX_FPS     = 15
+CAMERA_STREAM_MIN_QUALITY = 10
+CAMERA_STREAM_MAX_QUALITY = 90
+
+
+def build_camera_stream_command(enabled: bool = True, max_fps: int = 0,
+                                quality: int = 0) -> bytes:
+    """Keepalive, sent every second: pkt, cmd, enable, max_fps, quality.
+
+    0 means the firmware default.  The drone stops streaming 2.5 s after the
+    last enable packet, or at once on enabled=False.
+    """
+    if not 0 <= max_fps <= CAMERA_STREAM_MAX_FPS:
+        raise ValueError(f"fps must be 1-{CAMERA_STREAM_MAX_FPS}")
+    if quality and not CAMERA_STREAM_MIN_QUALITY <= quality <= CAMERA_STREAM_MAX_QUALITY:
+        raise ValueError(f"quality must be {CAMERA_STREAM_MIN_QUALITY}-"
+                         f"{CAMERA_STREAM_MAX_QUALITY}")
+    return struct.pack("<5B", PKT_CMD, CMD_CAMERA_STREAM, int(enabled),
+                       max_fps, quality)
+
+
+# One JPEG = data datagrams (header + payload) then an END datagram with no
+# payload and offset == frame_size.  Header layout: see main/camera_stream.c.
+CAMERA_MAGIC       = b"ECAM"
+CAMERA_VERSION     = 2
+CAMERA_FLAG_END    = 0x02
+CAMERA_HEADER_FMT  = "<4sBBBBIIIHHHHH"
+CAMERA_HEADER_SIZE = struct.calcsize(CAMERA_HEADER_FMT)   # 30 bytes
+
+
+@dataclass
+class CameraChunk:
+    flags:      int
+    drone_id:   int
+    boot_nonce: int      # random per drone boot
+    frame_id:   int
+    offset:     int
+    frame_size: int      # END only
+    width:      int
+    height:     int
+    age_ms:     int      # capture -> this datagram sent, on the drone
+    esp_drops:  int      # frames the drone dropped since boot (wraps)
+    payload:    bytes
+
+    @property
+    def is_end(self) -> bool:
+        return bool(self.flags & CAMERA_FLAG_END)
+
+
+def camera_packet_version(data: bytes) -> Optional[int]:
+    """Version byte of any ECAM datagram, else None (to report a mismatch)."""
+    return data[4] if len(data) >= 5 and data[:4] == CAMERA_MAGIC else None
+
+
+def parse_camera_chunk(data: bytes) -> Optional[CameraChunk]:
+    """Parse one camera datagram; None if malformed or another version."""
+    if len(data) < CAMERA_HEADER_SIZE:
+        return None
+    (magic, version, flags, drone_id, nonce, frame_id, offset, frame_size,
+     width, height, payload_len, age_ms, esp_drops) = struct.unpack_from(
+        CAMERA_HEADER_FMT, data)
+    if (magic != CAMERA_MAGIC or version != CAMERA_VERSION
+            or payload_len != len(data) - CAMERA_HEADER_SIZE):
+        return None
+    if flags & CAMERA_FLAG_END:
+        if payload_len or not frame_size or offset != frame_size:
+            return None
+    elif frame_size or not payload_len:
+        return None
+    return CameraChunk(flags, drone_id, nonce, frame_id, offset, frame_size,
+                       width, height, age_ms, esp_drops,
+                       bytes(data[CAMERA_HEADER_SIZE:]))
+
+
+# ---------------------------------------------------------------------------
+# Trajectory upload  (laptop → drone)
+#
+# The whole trajectory is uploaded before playback; the drone then plays it
+# on its own clock, so WiFi jitter cannot disturb the flight.
+# ---------------------------------------------------------------------------
+
+TRAJ_MAX_PTS   = 2400   # must match NAV_TRAJ_MAX_PTS in nav_task.h
+TRAJ_CHUNK_PTS = 80     # 8 + 80*12 = 968 B, fits WIFI_CMD_BUF_SIZE (1024)
+
+
+def build_traj_packets(traj_id: int, pts) -> list[bytes]:
+    """CMD_TRAJ_DATA chunks: pkt, cmd, id, total, offset, n, n x (x, y, z) f32.
+
+    pts: (x, y, z) NED offsets from the first point (m); traj_id: 1-255.
+    """
+    out = []
+    for off in range(0, len(pts), TRAJ_CHUNK_PTS):
+        chunk = pts[off:off + TRAJ_CHUNK_PTS]
+        buf = struct.pack("<BBBHHB", PKT_CMD, CMD_TRAJ_DATA, traj_id,
+                          len(pts), off, len(chunk))
+        buf += b"".join(struct.pack("<fff", *p) for p in chunk)
+        out.append(buf)
+    return out
+
+
+def build_traj_start(traj_id: int, dt_ms: int) -> bytes:
+    """CMD_TRAJ_START: play upload traj_id, one point every dt_ms."""
+    return struct.pack("<BBBH", PKT_CMD, CMD_TRAJ_START, traj_id, dt_ms)
 
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -31,12 +32,53 @@ static const char *TAG = "wifi";
 static volatile bool s_land_requested  = false;
 static volatile bool s_start_requested = false;
 static volatile bool s_wifi_connected  = false;
+static volatile bool s_camera_stream_requested = false;
+static volatile uint32_t s_camera_stream_keepalive_ms = 0;
+
+/* Viewer-requested preview fps | quality << 8 (0 = firmware default), in one
+ * word so the stream task on the other core reads a consistent pair. */
+static volatile uint32_t s_camera_stream_params = 0;
+
+/* Viewer refreshes its request once per second. */
+#define CAMERA_STREAM_TIMEOUT_MS 2500u
 
 /* Peer drone positions (map frame), protected by s_peer_mutex */
 static wifi_peer_list_t   s_peers = { .count = 0 };
 static SemaphoreHandle_t  s_peer_mutex;
 
 static EventGroupHandle_t s_wifi_events;
+
+static uint32_t parse_ipv4_or_abort(const char *name, const char *value)
+{
+    uint32_t addr = esp_ip4addr_aton(value);
+    if (addr == IPADDR_NONE) {
+        ESP_LOGE(TAG, "Invalid %s IPv4 address: %s", name, value);
+        abort();
+    }
+    return addr;
+}
+
+static void configure_static_ip(esp_netif_t *sta_netif)
+{
+    esp_err_t err = esp_netif_dhcpc_stop(sta_netif);
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+        ESP_ERROR_CHECK(err);
+    }
+
+    esp_netif_ip_info_t ip_info = {};
+    ip_info.ip.addr = parse_ipv4_or_abort(
+        "drone static", CONFIG_DRONE_STATIC_IPV4_ADDR);
+    ip_info.gw.addr = parse_ipv4_or_abort(
+        "gateway", CONFIG_WIFI_GATEWAY_IPV4_ADDR);
+    ip_info.netmask.addr = parse_ipv4_or_abort(
+        "netmask", CONFIG_WIFI_NETMASK_IPV4_ADDR);
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(sta_netif, &ip_info));
+
+    ESP_LOGI(TAG, "Static IP: %s (gateway %s, netmask %s)",
+             CONFIG_DRONE_STATIC_IPV4_ADDR,
+             CONFIG_WIFI_GATEWAY_IPV4_ADDR,
+             CONFIG_WIFI_NETMASK_IPV4_ADDR);
+}
 
 /* ---------------------------------------------------------------------------
  * WiFi event handler — auto-reconnect on disconnect
@@ -67,7 +109,9 @@ void wifi_task_init(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    configASSERT(sta_netif != NULL);
+    configure_static_ip(sta_netif);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -198,6 +242,52 @@ static void handle_peers(const uint8_t *buf, int len)
     ESP_LOGD(TAG, "CMD_SET_PEERS: %d peers", count);
 }
 
+/* CMD_CAMERA_STREAM keepalive: pkt, cmd, enable [, max_fps, quality]. */
+static void handle_camera_stream(const uint8_t *buf, int len)
+{
+    if (len < 3) return;
+    bool enable = buf[2] != 0;
+    uint32_t params = (len >= 5) ? (buf[3] | (uint32_t)buf[4] << 8) : 0;
+    bool changed = enable != wifi_camera_stream_enabled()
+                   || (enable && params != s_camera_stream_params);
+
+    if (enable) {
+        s_camera_stream_params = params;
+        s_camera_stream_keepalive_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    }
+    s_camera_stream_requested = enable;
+    if (changed && enable) {
+        ESP_LOGI(TAG, "Camera preview on (fps=%u q=%u, 0 = default)",
+                 (unsigned)(params & 0xFF), (unsigned)(params >> 8));
+    } else if (changed) {
+        ESP_LOGI(TAG, "Camera preview off");
+    }
+}
+
+/* CMD_TRAJ_DATA: pkt, cmd, id, total(u16), offset(u16), n, n × (x, y, z) float32 */
+static void handle_traj_data(const uint8_t *buf, int len)
+{
+    if (len < 8) return;
+    uint16_t total, offset;
+    memcpy(&total,  buf + 3, sizeof(total));
+    memcpy(&offset, buf + 5, sizeof(offset));
+    int n = buf[7];
+    if (len < 8 + n * 12) {
+        ESP_LOGW(TAG, "CMD_TRAJ_DATA truncated (%d < %d)", len, 8 + n * 12);
+        return;
+    }
+    nav_traj_put(buf[2], total, offset, buf + 8, n);
+}
+
+/* CMD_TRAJ_START: pkt, cmd, id, dt_ms(u16) */
+static void handle_traj_start(const uint8_t *buf, int len)
+{
+    if (len < 5) return;
+    uint16_t dt_ms;
+    memcpy(&dt_ms, buf + 3, sizeof(dt_ms));
+    nav_traj_start(buf[2], dt_ms);
+}
+
 wifi_peer_list_t wifi_get_peers(void)
 {
     xSemaphoreTake(s_peer_mutex, portMAX_DELAY);
@@ -271,12 +361,19 @@ void wifi_task(void *arg)
     TickType_t last_wake = xTaskGetTickCount();
 
     while (1) {
-        /* ---- Check for incoming commands (non-blocking) ---- */
+        /* ---- Drain all queued commands (non-blocking) ---- */
         {
-            uint8_t cmd_buf[256];
-            int len = recvfrom(rx_sock, cmd_buf, sizeof(cmd_buf), 0, NULL, NULL);
-            if (len >= 2 && cmd_buf[0] == WIFI_PKT_CMD) {
-                if (cmd_buf[1] == CMD_SET_NAV_TAGS) {
+            uint8_t cmd_buf[WIFI_CMD_BUF_SIZE];
+            int len;
+            while ((len = recvfrom(rx_sock, cmd_buf, sizeof(cmd_buf), 0, NULL, NULL)) > 0) {
+                if (len < 2 || cmd_buf[0] != WIFI_PKT_CMD) continue;
+                if (cmd_buf[1] == CMD_TRAJ_DATA) {
+                    handle_traj_data(cmd_buf, len);
+                } else if (cmd_buf[1] == CMD_TRAJ_START) {
+                    handle_traj_start(cmd_buf, len);
+                } else if (cmd_buf[1] == CMD_CAMERA_STREAM) {
+                    handle_camera_stream(cmd_buf, len);
+                } else if (cmd_buf[1] == CMD_SET_NAV_TAGS) {
                     handle_nav_tags(cmd_buf, len);
                 } else if (cmd_buf[1] == CMD_SET_PEERS) {
                     handle_peers(cmd_buf, len);
@@ -390,4 +487,20 @@ void wifi_clear_start_request(void)
 bool wifi_is_connected(void)
 {
     return s_wifi_connected;
+}
+
+bool wifi_camera_stream_enabled(void)
+{
+    if (!s_camera_stream_requested) return false;
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    return (uint32_t)(now_ms - s_camera_stream_keepalive_ms)
+           < CAMERA_STREAM_TIMEOUT_MS;
+}
+
+bool wifi_camera_stream_get(wifi_camera_stream_req_t *out)
+{
+    uint32_t params = s_camera_stream_params;
+    out->max_fps = (uint8_t)params;
+    out->quality = (uint8_t)(params >> 8);
+    return wifi_camera_stream_enabled();
 }

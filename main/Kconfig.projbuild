@@ -29,9 +29,28 @@ menu "Drone Configuration"
 
     config HOST_IPV4_ADDR
         string "IPV4 Address"
-        default "192.168.50.160"
+        default "192.168.1.100"
         help
-            IPV4 address to which the client example will send data.
+            Laptop/QGroundControl IPv4 address to which the drone sends data.
+
+    config DRONE_STATIC_IPV4_ADDR
+        string "Drone static IPv4 address"
+        default "192.168.1.200"
+        help
+            Static station address assigned to this ESP32. flash_drone.sh
+            sets this to 192.168.1.(200 + CONFIG_DRONE_ID).
+
+    config WIFI_GATEWAY_IPV4_ADDR
+        string "WiFi gateway IPv4 address"
+        default "192.168.1.1"
+        help
+            IPv4 address of the WiFi access point/router.
+
+    config WIFI_NETMASK_IPV4_ADDR
+        string "WiFi netmask"
+        default "255.255.255.0"
+        help
+            IPv4 netmask for the drone's static WiFi address.
 
     config TOF_BRIDGE_PORT
         int "TOF bridge port (outgoing)"
@@ -112,5 +131,19 @@ menu "Drone Configuration"
         default 4
         help
           GPIO PX4 RX PIN
+
+    config CAMERA_STREAM_DEFAULT_FPS
+        int "Camera preview default frame rate"
+        range 1 15
+        default 10
+        help
+          Used when laptop/camera_stream.py does not pass --fps.
+
+    config CAMERA_STREAM_DEFAULT_QUALITY
+        int "Camera preview default JPEG quality"
+        range 10 90
+        default 60
+        help
+          Used when laptop/camera_stream.py does not pass --quality.
 
 endmenu
