@@ -28,7 +28,10 @@ either expressed or implied, of the Regents of The University of Michigan.
 #include <stdlib.h>
 #include "tag16h5.h"
 
-static uint64_t codedata[20] = {
+/* Truncated family: only the IDs this project uses (0-11 landing tags,
+   12-21 nav tags, see laptop/setup.yaml).  ncodes below is derived from this
+   array — a mismatch reads past the end and makes IDs undetectable. */
+static uint64_t codedata[22] = {
    0x00000000000027c8UL,
    0x00000000000031b6UL,
    0x0000000000003859UL,
@@ -49,8 +52,8 @@ static uint64_t codedata[20] = {
    0x0000000000008f34UL,
    0x000000000000b4c0UL,
    0x00000000000051ecUL,
-   // 0x000000000000e6f0UL,
-   // 0x0000000000005fa4UL,
+   0x000000000000e6f0UL,
+   0x0000000000005fa4UL,
    // 0x000000000000dd43UL,
    // 0x0000000000001aaaUL,
    // 0x000000000000e62fUL,
@@ -65,7 +68,7 @@ apriltag_family_t *tag16h5_create()
    apriltag_family_t *tf = calloc(1, sizeof(apriltag_family_t));
    tf->name = strdup("tag16h5");
    tf->h = 5;
-   tf->ncodes = 30;
+   tf->ncodes = sizeof(codedata) / sizeof(codedata[0]);
    tf->codes = codedata;
    tf->nbits = 16;
    tf->bit_x = calloc(16, sizeof(uint32_t));

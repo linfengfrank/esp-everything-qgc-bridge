@@ -2,6 +2,9 @@ build/
 .cache/
 .vscode/
 
+# Host build of the in-tree AprilTag detector (laptop/apriltag_host.py)
+laptop/.apriltag-host/
+
 # Python
 __pycache__/
 *.py[cod]

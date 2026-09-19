@@ -39,6 +39,9 @@ python laptop/run_exploration.py
 
 # Fleet exploration (multiple drones, no relay)
 python laptop/run_fleet_exploration.py
+
+# Live camera view with AprilTags detected and drawn on every frame
+python laptop/tag_stream.py --esp-ip 192.168.1.222
 ```
 
 Fleet configuration (drone IDs, start positions, arena bounds, nav tags) lives in `laptop/setup.yaml`.
@@ -59,7 +62,7 @@ Dual-core FreeRTOS on ESP32-S3. Tasks are pinned to specific cores:
 | `mission_task` | 1 | 2 | — | State machine: arm → takeoff → explore → precision land |
 | `camera_stream_task` | 0 | 1 | on demand | JPEG camera preview for `camera_stream.py` (started by `at_detect_task`) |
 
-**Camera**: two frame buffers (`fb_count=2`) shared by `at_detect_task` and `camera_stream_task`; both fetch via `camera_fb_get_fresh()` and return each buffer once. Internal RAM is tight: `esp-apriltag` allocates from PSRAM (`apriltag_psram_alloc.h`), and big buffers belong in PSRAM.
+**Camera**: two frame buffers (`fb_count=2`) shared by `at_detect_task` and `camera_stream_task`; both fetch via `camera_fb_get_fresh()` and return each buffer once. Internal RAM is tight: `esp-apriltag` allocates from PSRAM (`apriltag_psram_alloc.h`), and big buffers belong in PSRAM. `laptop/tag_stream.py` compiles the same `esp-apriltag` sources for the laptop so its overlay matches what the drone decodes; keep `at_detect.c`'s parameters and gate in sync with `laptop/apriltag_host.py`.
 
 **Setpoint ownership**: `mission_task` owns MAVLink setpoints during takeoff/landing. `nav_task` takes over when `nav_set_goal_ned()` is called. `nav_cancel()` returns ownership to mission.
 
@@ -77,6 +80,8 @@ Dual-core FreeRTOS on ESP32-S3. Tasks are pinned to specific cores:
 
 - `protocol.py` — packed struct definitions for the UDP wire format (telemetry, commands, camera preview)
 - `camera_stream.py` — live camera viewer (`--esp-ip`, `--fps`, `--quality`)
+- `apriltag_host.py` + `apriltag_host_shim.c` — ctypes binding to `components/esp-apriltag` compiled for the laptop (cached in `laptop/.apriltag-host/`), so laptop-side detections carry firmware semantics: same code table, same decision-margin scale (3.4.5 computes it after `decode_sharpening`; a pip AprilTag does not), same gate, same pose
+- `tag_stream.py` — `camera_stream.py` plus AprilTags: detects on every frame with `apriltag_host.py` and draws an outline + id per tag; `--detail` adds the gate's rejects, the HUD and the drone's own `:5008` detections, which lag the video by ~1 s
 - `comms.py` — `CommsNode` class: UDP send/recv, drone IP discovery, nav-tag broadcast, peer position relay
 - `exploration.py` — `ExplorationDirector`: picks least-explored VFH gap, scores by crumb density + heading continuity + peer goal repulsion
 - `crumb_store.py` — breadcrumb trail storage (map frame), cone density queries
