@@ -2,7 +2,7 @@
 #   python3 -m pip install -r laptop/requirements.txt
 PyYAML>=6.0
 numpy>=1.24
-opencv-python>=4.8
+opencv-python>=4.8,<5   # OpenCV 5 changes text metrics: tag_stream's HUD layout
 matplotlib>=3.7
 scipy>=1.10
 pyserial>=3.5
