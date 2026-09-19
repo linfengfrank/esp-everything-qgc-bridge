@@ -11,7 +11,7 @@ The trajectory is flown relative to where the drone hovers when it starts.
 
 Example:
     python3 laptop/send_trajectory.py --drone-id 2 --takeoff \
-        --trajectory ../CDE1302_UAV/circle_traj.csv
+        --trajectory trajectory/circle_traj.csv
 """
 
 import argparse

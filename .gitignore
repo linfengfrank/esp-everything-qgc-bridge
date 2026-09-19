@@ -5,6 +5,13 @@ build/
 # Host build of the in-tree AprilTag detector (laptop/apriltag_host.py)
 laptop/.apriltag-host/
 
+# MATLAB / Simulink
+slprj/
+*.slxc
+*.autosave
+*.asv
+*.m~
+
 # Python
 __pycache__/
 *.py[cod]
