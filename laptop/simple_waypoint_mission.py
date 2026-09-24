@@ -213,7 +213,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--takeoff-wait",
         type=float,
-        default=3.0,
+        default=10.0,
         help="Seconds to wait after CMD_START before sending the first waypoint.",
     )
     parser.add_argument(

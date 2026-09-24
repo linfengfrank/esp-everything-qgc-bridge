@@ -188,12 +188,12 @@ different laptop is viewing the camera.
 
 Check the communication without sending flight commands.
 ```bash
-python3 laptop/send_trajectory.py --drone-id [DRONE_ID] --takeoff --monitor-only
+python3 laptop/simple_arm_takeoff_land.py --monitor-only --drone-id [DRONE_ID] 
 ```
 
 Takeoff -> hover at 0.5 m altitude -> land. The altitude is 0.5 m by default, but you better check the parameter `CRUISE_ALT_M` in the flight controller.
 ```bash
-python3 laptop/send_trajectory.py --drone-id [DRONE_ID] --takeoff
+python3 laptop/simple_arm_takeoff_land.py --drone-id [DRONE_ID]
 ```
 Type `ARM-[drone ID]` when prompted.
 
@@ -201,8 +201,8 @@ Type `ARM-[drone ID]` when prompted.
 
 ```bash
 python3 laptop/simple_waypoint_mission.py \
-  --drone-id [DRONE_ID] \
-  --waypoints-file waypoints/waypoints_example.txt
+  --waypoints-file waypoints/waypoints_example.txt \
+  --drone-id [DRONE_ID]
 ```
 
 ## 6. Fly from a CSV trajectory
