@@ -3,6 +3,8 @@
 ESP32-S3 companion-computer firmware for CDE1302.
 It consists of ESP32 firmware in `main/` and a laptop-side Python scripts in `laptop/`.
 
+Note that the example drone ID in this README is 22. You need to change it to your drone's ID when running the scripts.
+
 ## 1. Setup ESP32 (Optional)
 
 You can skip this if you only want to run the laptop scripts. The ESP32 firmware is already built and flashed into the drone's ESP32-S3.
@@ -182,12 +184,33 @@ allow client-to-client traffic, and the viewer firewall must allow Python to
 receive UDP 5008 and 5009. MAVLink remains on `CONFIG_HOST_IPV4_ADDR` while a
 different laptop is viewing the camera.
 
-## 4. Fly from a CSV trajectory
+## 4. Simple arming and takeoff (Lab 5)
+
+Check the communication without sending flight commands.
+```bash
+python3 laptop/send_trajectory.py --drone-id [DRONE_ID] --takeoff --monitor-only
+```
+
+Takeoff -> hover at 0.5 m altitude -> land. The altitude is 0.5 m by default, but you better check the parameter `CRUISE_ALT_M` in the flight controller.
+```bash
+python3 laptop/send_trajectory.py --drone-id [DRONE_ID] --takeoff
+```
+Type `ARM-[drone ID]` when prompted.
+
+## 5. Send a waypoint mission (Lab 5)
+
+```bash
+python3 laptop/simple_waypoint_mission.py \
+  --drone-id [DRONE_ID] \
+  --waypoints-file waypoints/waypoints_example.txt
+```
+
+## 6. Fly from a CSV trajectory
 
 This is 2x1 ellipse minimum-snap trajectory. Put the drone at the tip of the major axis, facing outward. The take off placement can be seen in `trajectory/ellipse_start_placement.png`.
 
 ```bash
-python3 laptop/send_trajectory.py --drone-id 22 --takeoff --trajectory trajectory/ellipse_min_snap_traj.csv
+python3 laptop/send_trajectory.py --drone-id [DRONE_ID] --takeoff --trajectory trajectory/ellipse_min_snap_traj.csv
 ```
 
 See `trajectory/README.md` for the included circle and compact minimum-snap
