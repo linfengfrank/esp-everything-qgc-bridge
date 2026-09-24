@@ -1,31 +1,36 @@
 # Trajectories
 
-Check this repo
-[CDE1302_UAV](https://github.com/linfengfrank/CDE1302_UAV).
+CSV files use `t,x,y,z` (seconds and NED metres). The uploader makes each path
+relative to the hover position and holds the drone's starting heading.
 
-## Generate
+## Minimum-snap ellipse
 
-Open `circle_traj_demo.m` in MATLAB and Run.
-It writes `circle_traj.csv` (`t,x,y,z`: s, NED m, 100 Hz) next to itself, then
-simulates tracking it. The CSV needs only MATLAB. The simulation also needs
-Simulink, Aerospace Blockset, Aerospace Toolbox, and Robotics System Toolbox or
-UAV Toolbox.
+- 2.00 m North-South major axis × 1.00 m East-West minor axis
+- 36 s clockwise lap; approximately 0.283 m/s peak speed
+- Starts and finishes at rest at the +North major-axis tip
 
-Keep `R*omega` at or below 0.3 m/s, since `send_trajectory.py` refuses anything
-faster. The circle always runs clockwise seen from above; a negative `omega`
-gives an empty CSV.
+Place the drone at that tip with its nose outward in **+North / +x**. The centre
+is 1.00 m behind it in **-North / -x**, and the path extends 0.50 m to either
+side. Confirm the axes in QGC and allow extra safety clearance.
 
-## Fly
+Run `ellipse_min_snap_demo.m` in MATLAB to regenerate the CSV and placement
+guide. Set `run_simulation = true` for the optional Simulink test.
+
+```bash
+python3 laptop/send_trajectory.py --drone-id 22 --takeoff --takeoff-wait 12 \
+    --trajectory trajectory/ellipse_min_snap_traj.csv
+```
+
+## Circle
+
+Run `circle_traj_demo.m` in MATLAB to regenerate the default clockwise circle:
+2 m diameter, approximately 21 s, starting toward `+y`. From takeoff it spans
+`x = 0..-2 m` and `y = -1..+1 m`.
 
 ```bash
 python3 laptop/send_trajectory.py --drone-id 22 --takeoff --takeoff-wait 12 \
     --trajectory trajectory/circle_traj.csv
 ```
 
-- The path starts wherever the drone is hovering, and the drone holds its heading.
-- The drone starts the path once it is armed in OFFBOARD, even if it is still
-  climbing, so leave enough `--takeoff-wait` to reach 0.5 m.
-- From the start point, the default circle covers x 0 to -2 m and y -1 to +1 m
-  (R = 1 m, 0.3 m/s, about 21 s). It heads toward +y first.
-- x/y are PX4's local axes, not the drone's nose. Check which way +x points
-  (QGC, `LOCAL_POSITION_NED`), then clear about 3 m x 3 m on the drone's -x side.
+Keep generated paths at or below 0.30 m/s. CSV generation needs MATLAB; the
+optional simulations also require Simulink and the model's toolboxes.
