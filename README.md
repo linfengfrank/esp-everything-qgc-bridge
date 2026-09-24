@@ -184,8 +184,11 @@ different laptop is viewing the camera.
 
 ## 4. Fly from a CSV trajectory
 
+This is 2x1 ellipse minimum-snap trajectory. Put the drone at the tip of the major axis, facing outward. The take off placement can be seen in `trajectory/ellipse_start_placement.png`.
+
 ```bash
-python3 laptop/send_trajectory.py --drone-id 22 --takeoff --trajectory trajectory/circle_traj.csv
+python3 laptop/send_trajectory.py --drone-id 22 --takeoff --trajectory trajectory/ellipse_min_snap_traj.csv
 ```
 
-See `trajectory/README.md` to generate the CSV and for the space it needs.
+See `trajectory/README.md` for the included circle and compact minimum-snap
+ellipse, how to regenerate their CSV files, and the space each path needs.
