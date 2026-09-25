@@ -6,7 +6,7 @@ relative to the hover position and holds the drone's starting heading.
 ## Minimum-snap ellipse
 
 - 2.00 m North-South major axis × 1.00 m East-West minor axis
-- 36 s clockwise lap; approximately 0.283 m/s peak speed
+- 34 s clockwise lap; approximately 0.300 m/s peak speed
 - Starts and finishes at rest at the +North major-axis tip
 
 Place the drone at that tip with its nose outward in **+North / +x**. The centre
