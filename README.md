@@ -9,6 +9,8 @@ Note that the example drone ID in this README is 22. You need to change it to yo
 
 You can skip this if you only want to run the laptop scripts. The ESP32 firmware is already built and flashed into the drone's ESP32-S3.
 
+In this step, you need to connect to the internet to be able to build, and close the QGroundControl app if it is running. The ESP32-S3 must be connected to the laptop via USB.
+
 Everything this firmware needs is committed in-tree (MAVLink `c_library_v2`,
 esp-apriltag, the VL53L5CX driver and `managed_components/`). The only external
 dependency is ESP-IDF itself:
