@@ -10,7 +10,7 @@ CSV: columns t,x,y,z (s, NED m); a header row and '#' comments are allowed.
 The trajectory is flown relative to where the drone hovers when it starts.
 
 Example:
-    python3 laptop/send_trajectory.py --drone-id 2 --takeoff \
+    python3 laptop/send_trajectory.py --drone-id 2 --takeoff --confirm \
         --trajectory trajectory/circle_traj.csv
 """
 
@@ -73,6 +73,8 @@ def main() -> None:
                     help="Seconds from CMD_START to trajectory upload")
     ap.add_argument("--finish", choices=["land", "hold"], default="land",
                     help="Action after the trajectory")
+    ap.add_argument("--confirm", action="store_true",
+                    help="Require typing TRAJ-<drone id> before sending any flight commands")
     ap.add_argument("--telem-port", type=int, default=5005)
     ap.add_argument("--cmd-port", type=int, default=5006)
     args = ap.parse_args()
@@ -120,6 +122,12 @@ def main() -> None:
     try:
         if not wait_for(lambda p: True, 30.0):
             raise RuntimeError(f"no telemetry from drone {args.drone_id}")
+
+        if args.confirm:
+            answer = input(f"Type TRAJ-{args.drone_id} to fly {args.trajectory}: ").strip()
+            if answer != f"TRAJ-{args.drone_id}":
+                log.info("confirmation did not match; trajectory cancelled")
+                return
 
         if args.takeoff:
             send(CMD_START, "CMD_START")

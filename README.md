@@ -221,8 +221,10 @@ Full procedure: [waypoints/WAYPOINT_FLIGHT_TEST_GUIDE.md](waypoints/WAYPOINT_FLI
 This is 2x1 ellipse minimum-snap trajectory. Put the drone at the tip of the major axis, facing outward. The take off placement can be seen in `trajectory/ellipse_start_placement.png`.
 
 ```bash
-python3 laptop/send_trajectory.py --takeoff --takeoff-wait 12 --trajectory trajectory/ellipse_min_snap_traj.csv --drone-id [DRONE_ID]
+python3 laptop/send_trajectory.py --takeoff --takeoff-wait 12 --trajectory trajectory/ellipse_min_snap_traj.csv --drone-id [DRONE_ID] --confirm
 ```
+
+`--confirm` asks for `TRAJ-[drone ID]` before anything is sent.
 
 See `trajectory/README.md` for the included circle and compact minimum-snap
 ellipse, how to regenerate their CSV files, and the space each path needs.
