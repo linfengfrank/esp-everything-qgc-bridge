@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """
-Simple arm -> takeoff -> hover -> land test for the EXISTING Python GCS.
+Arm -> takeoff -> hover -> land test over the custom UDP protocol
+(telemetry ESP32 -> laptop UDP 5005, commands laptop -> ESP32 UDP 5006).
 
-This script uses the project's custom UDP protocol:
-    ESP32 -> laptop telemetry: UDP 5005
-    laptop -> ESP32 commands:  UDP 5006
+    CMD_START = OFFBOARD + arm + take off to CRUISE_ALT_M (0.5 m)
+    CMD_HOLD  = cancel navigation and hold
+    CMD_LAND  = land in place (also aborts a takeoff in progress)
 
-It must be placed in the project's laptop/ directory beside:
-    comms.py, protocol.py, setup.yaml
+Telemetry has no altitude, armed state or PX4 mode: watch QGroundControl
+and the ESP32 serial monitor.
 
-Current firmware behavior:
-    CMD_START = switch to Offboard + arm + take off to CRUISE_ALT_M (0.5 m)
-    CMD_HOLD  = cancel navigation and hold current position
-    CMD_LAND  = land in place
-
-The custom telemetry packet does not contain altitude, armed state, or PX4 mode.
-For the first test, use QGroundControl and the ESP32 serial monitor to verify
-those states.
+    python3 laptop/simple_arm_takeoff_land.py --drone-id 22 [--monitor-only]
 """
 
 from __future__ import annotations
@@ -42,8 +36,7 @@ try:
     )
 except ImportError as exc:
     raise SystemExit(
-        "Cannot import comms.py and protocol.py.\n"
-        "Copy this file into the project's laptop directory."
+        "Cannot import comms.py / protocol.py — run this script from the repo."
     ) from exc
 
 
@@ -82,8 +75,6 @@ class TelemetryTracker:
             )
             self._condition.notify_all()
 
-        #log.info("Received telemetry from drone %d at %s", self.drone_id, source_ip)
-
     def latest(self) -> TelemetrySnapshot:
         with self._condition:
             return TelemetrySnapshot(
@@ -92,7 +83,7 @@ class TelemetryTracker:
                 received_at=self._snapshot.received_at,
             )
 
-    def wait_for_first_packet(self, timeout_s: float) -> TelemetrySnapshot:
+    def wait_for_first_packet(self, timeout_s: float, port: int, heard) -> TelemetrySnapshot:
         deadline = time.monotonic() + timeout_s
 
         with self._condition:
@@ -100,7 +91,8 @@ class TelemetryTracker:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
-                        f"No telemetry from drone {self.drone_id} on UDP 5005."
+                        f"No telemetry from drone {self.drone_id} on UDP {port} "
+                        f"(heard drones: {sorted(heard()) or 'none'})."
                     )
                 self._condition.wait(timeout=min(0.5, remaining))
 
@@ -112,13 +104,16 @@ def send_command(
     drone_id: int,
     command_type: int,
     name: str,
+    repeat: int = 1,
 ) -> None:
     """Send a custom command after the drone IP has been learned."""
-    ok = comms.send_command(drone_id, CommandPacket(command_type))
-    if not ok:
-        raise RuntimeError(
-            f"Failed to send {name}: drone {drone_id} IP is unknown."
-        )
+    for _ in range(repeat):
+        if not comms.send_command(drone_id, CommandPacket(command_type)):
+            raise RuntimeError(
+                f"Failed to send {name}: drone {drone_id} IP is unknown."
+            )
+        if repeat > 1:
+            time.sleep(0.1)
     log.info("%s sent to drone %d.", name, drone_id)
 
 
@@ -166,13 +161,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--drone-id",
         type=int,
-        default=2,
-        help="ESP32 CONFIG_DRONE_ID. Current sdkconfig value: 2.",
+        required=True,
+        help="Flashed ESP32 CONFIG_DRONE_ID.",
     )
     parser.add_argument(
         "--config",
-        default="setup.yaml",
-        help="Path to setup.yaml. Default: setup.yaml.",
+        default=str(Path(__file__).with_name("setup.yaml")),
+        help="Path to setup.yaml. Default: laptop/setup.yaml.",
     )
     parser.add_argument(
         "--telem-port",
@@ -229,10 +224,7 @@ def main() -> int:
 
     config_path: Optional[str] = args.config
     if not Path(args.config).exists():
-        log.warning(
-            "%s was not found. Continuing without automatic nav-tag setup.",
-            args.config,
-        )
+        log.warning("%s not found — no start offset sent.", args.config)
         config_path = None
 
     tracker = TelemetryTracker(args.drone_id)
@@ -258,7 +250,9 @@ def main() -> int:
             args.drone_id,
             args.telem_port,
         )
-        snapshot = tracker.wait_for_first_packet(args.connect_timeout)
+        snapshot = tracker.wait_for_first_packet(
+            args.connect_timeout, args.telem_port, comms.known_drones
+        )
         assert snapshot.packet is not None
 
         log.info(
@@ -287,9 +281,8 @@ def main() -> int:
             "  1. Validate communication with --monitor-only.\n"
             "  2. For a bench test, remove all propellers.\n"
             "  3. For flight, clear the area and prepare supervised manual takeover.\n"
-            "  4. Confirm all ToF sensors are healthy in the ESP32 monitor.\n"
-            "  5. Confirm PX4 local position is valid.\n"
-            "  6. Keep QGroundControl open for observation only.\n"
+            "  4. ESP32 monitor shows 'Waiting for CMD_START from laptop...'.\n"
+            "  5. Keep QGroundControl open for observation only.\n"
         )
 
         confirmation = input(
@@ -310,7 +303,7 @@ def main() -> int:
             stale_timeout_s=args.stale_timeout,
         )
 
-        # Ensure no navigation goal remains active and capture a hold setpoint.
+        # Stops any active goal (no-op otherwise).
         send_command(comms, args.drone_id, CMD_HOLD, "CMD_HOLD")
 
         wait_and_report(
@@ -320,7 +313,7 @@ def main() -> int:
             stale_timeout_s=args.stale_timeout,
         )
 
-        send_command(comms, args.drone_id, CMD_LAND, "CMD_LAND")
+        send_command(comms, args.drone_id, CMD_LAND, "CMD_LAND", repeat=3)
         land_sent = True
 
         log.info(
@@ -334,7 +327,7 @@ def main() -> int:
         log.warning("Ctrl+C received.")
         if start_sent and not land_sent:
             try:
-                send_command(comms, args.drone_id, CMD_LAND, "fallback CMD_LAND")
+                send_command(comms, args.drone_id, CMD_LAND, "fallback CMD_LAND", repeat=3)
                 time.sleep(1.0)
             except Exception as exc:
                 log.error("Could not send fallback LAND: %s", exc)
@@ -344,7 +337,7 @@ def main() -> int:
         log.error("Test aborted: %s", exc)
         if start_sent and not land_sent:
             try:
-                send_command(comms, args.drone_id, CMD_LAND, "fallback CMD_LAND")
+                send_command(comms, args.drone_id, CMD_LAND, "fallback CMD_LAND", repeat=3)
                 time.sleep(1.0)
             except Exception as land_exc:
                 log.error("Could not send fallback LAND: %s", land_exc)

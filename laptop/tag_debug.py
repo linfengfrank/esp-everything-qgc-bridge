@@ -56,17 +56,18 @@ TELEM_PORT     = 5005
 LINK_TIMEOUT_S = 1.5    # no debug packet for this long → link down
 FRAME_STALL_S  = 2.5    # packets arrive but frame_ms frozen → camera stalled
 
-# Must match at_detect.c (camera pitched 45° nose-down, 2 cm ahead of centre)
+# Camera mount: pitched 45° nose-down, 2 cm ahead of centre
 CAM_PITCH_DEG    = 45.0
 CAM_FWD_OFFSET_M = 0.02
 
-# Firmware acts on a pose only when reprojection error < 0.5 (at_detect.c)
+# Firmware keeps a tag pose (telemetry tag_dist_m) only when reprojection
+# error < 0.5 (at_detect.c); no pose ever affects flight.
 POSE_ERR_LIMIT = 0.5
 
 
 def cam_to_body(tx: float, ty: float, tz: float) -> tuple:
     """Camera-frame translation → body-frame (fwd, right, hdist).
-    Mirrors camera_to_ned() in at_detect.c without the heading rotation."""
+    The 45°-pitched camera transform, without the heading rotation."""
     pitch = math.radians(CAM_PITCH_DEG)
     fwd   = math.cos(pitch) * tz + math.sin(pitch) * ty + CAM_FWD_OFFSET_M
     right = tx

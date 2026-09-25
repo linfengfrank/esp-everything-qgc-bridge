@@ -1,13 +1,15 @@
 # esp-everything-qgc-bridge
 
 ESP32-S3 companion-computer firmware for CDE1302.
-It consists of ESP32 firmware in `main/` and a laptop-side Python scripts in `laptop/`.
+It consists of ESP32 firmware in `main/` and laptop-side Python scripts in `laptop/`.
 
 Note that the example drone ID in this README is 22. You need to change it to your drone's ID when running the scripts.
 
 ## 1. Setup ESP32 (Optional)
 
 You can skip this if you only want to run the laptop scripts. The ESP32 firmware is already built and flashed into the drone's ESP32-S3.
+
+In this step, you need to connect to the internet to be able to build, and close the QGroundControl app if it is running. The ESP32-S3 must be connected to the laptop via USB.
 
 Everything this firmware needs is committed in-tree (MAVLink `c_library_v2`,
 esp-apriltag, the VL53L5CX driver and `managed_components/`). The only external
@@ -40,7 +42,7 @@ generated header really is that drone, flashes, then restores `sdkconfig`:
 Note that this requires internet to build this.
 
 It finds ESP-IDF automatically (`$IDF_PATH`, `./esp-idf`, `../esp-idf`,
-`~/esp/esp-idf`), sourcing `export.sh` only if needed.
+`~/esp/esp-idf`, `~/esp-idf`), sourcing `export.sh` only if needed.
 
 ### Deterministic drone addresses
 
@@ -82,7 +84,7 @@ and macOS 13+ (14+ on an Intel Mac); older systems fall back to compiling
 OpenCV or SciPy from source.
 
 1. Install conda once per machine. An existing Anaconda or Miniconda works;
-   on a new machine install Miniforge (on Windows, see [Windows](#windows)):
+   on a new machine install Miniforge (on Windows, see [Windows](#windows-havent-tested-yet)):
 
    ```bash
    curl -LO "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
@@ -115,9 +117,9 @@ After `laptop/requirements.txt` changes, update the environment with
 `tag_stream.py` compiles the drone's AprilTag detector on its first run, so
 it needs a C compiler: `xcode-select --install` on macOS,
 `sudo apt install build-essential` on Ubuntu. For Windows, see step 3 of
-[Windows](#windows).
+[Windows](#windows-havent-tested-yet).
 
-### Windows (Havn't tested yet)
+### Windows (Haven't tested yet)
 
 Follow the conda steps above, with these changes:
 
@@ -167,7 +169,7 @@ python3 laptop/camera_stream.py --esp-ip 192.168.1.222 [--fps 10] [--quality 60]
 
 `s` saves a frame.
 
-With ApriTags drawn on the frame:
+With AprilTags drawn on the frame:
 ```bash
 python3 laptop/tag_stream.py --esp-ip 192.168.1.222 [--detail]
 ```
@@ -186,32 +188,45 @@ different laptop is viewing the camera.
 
 ## 4. Simple arming and takeoff (Lab 5)
 
+`--drone-id` (required) is the ID flashed into the ESP32. The camera/AprilTag
+pipeline (section 3) never affects flights: tags are only detected and reported.
+
 Check the communication without sending flight commands.
 ```bash
-python3 laptop/simple_arm_takeoff_land.py --monitor-only --drone-id [DRONE_ID] 
+python3 laptop/simple_arm_takeoff_land.py --monitor-only --drone-id [DRONE_ID]
 ```
 
-Takeoff -> hover at 0.5 m altitude -> land. The altitude is 0.5 m by default, but you better check the parameter `CRUISE_ALT_M` in the flight controller.
+Takeoff -> hover at 0.5 m altitude -> land. The altitude is `CRUISE_ALT_M` in the ESP32 firmware (`main/main.c`; keep `WIFI_CRUISE_ALT_M` in `main/wifi_task.c` equal).
 ```bash
 python3 laptop/simple_arm_takeoff_land.py --drone-id [DRONE_ID]
 ```
 Type `ARM-[drone ID]` when prompted.
+
+Full procedure: [laptop/TEST_GUIDE.md](laptop/TEST_GUIDE.md).
 
 ## 5. Send a waypoint mission (Lab 5)
 
 ```bash
 python3 laptop/simple_waypoint_mission.py \
   --waypoints-file waypoints/waypoints_example.txt \
-  --drone-id [DRONE_ID]
+  --drone-id [DRONE_ID] --confirm
 ```
+
+`--confirm` asks for `MISSION-[drone ID]`; without it the drone takes off as
+soon as telemetry arrives. Waypoints are `x,y` metres (x = north, y = east) from
+PX4's local origin, plus the drone's start offset in `laptop/setup.yaml` if listed.
+
+Full procedure: [waypoints/WAYPOINT_FLIGHT_TEST_GUIDE.md](waypoints/WAYPOINT_FLIGHT_TEST_GUIDE.md).
 
 ## 6. Fly from a CSV trajectory
 
 This is 2x1 ellipse minimum-snap trajectory. Put the drone at the tip of the major axis, facing outward. The take off placement can be seen in `trajectory/ellipse_start_placement.png`.
 
 ```bash
-python3 laptop/send_trajectory.py --drone-id [DRONE_ID] --takeoff --trajectory trajectory/ellipse_min_snap_traj.csv
+python3 laptop/send_trajectory.py --takeoff --takeoff-wait 12 --trajectory trajectory/ellipse_min_snap_traj.csv --drone-id [DRONE_ID] --confirm
 ```
+
+`--confirm` asks for `TRAJ-[drone ID]` before anything is sent.
 
 See `trajectory/README.md` for the included circle and compact minimum-snap
 ellipse, how to regenerate their CSV files, and the space each path needs.

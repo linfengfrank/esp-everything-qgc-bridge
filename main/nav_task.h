@@ -74,10 +74,10 @@ void nav_task(void *arg);
 /* Set a new goal in MAP frame (NED metres).
  *   map_x, map_y: horizontal position in map frame.
  *   z: NED down (negative = above ground, e.g. -1.5 = 1.5 m AGL).
- * Converted to odom frame each nav tick so reloc corrections apply. */
+ * Converted to odom each tick with the fixed start offset. */
 void nav_set_goal_map(float map_x, float map_y, float z);
 
-/* Cancel navigation — transitions to NAV_IDLE and commands position hold. */
+/* Cancel goal/trajectory → NAV_IDLE + position hold.  No-op if none active. */
 void nav_cancel(void);
 
 /* Store points [offset, offset+n) of trajectory upload `id` (`total` points).

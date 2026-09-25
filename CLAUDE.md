@@ -61,15 +61,15 @@ Dual-core FreeRTOS on ESP32-S3. Tasks are pinned to specific cores:
 | `tof_task` | 0 | 4 | 15 Hz | Reads 8× VL53L5CX ToF sensors via I2C mux (TCA9548A) |
 | `wifi_task` | 0 | 2 | 10 Hz | UDP telemetry to laptop, receives commands |
 | `nav_task` | 1 | 4 | 20 Hz | VFH obstacle avoidance, goal navigation, collision avoidance, WiFi killswitch |
-| `at_detect_task` | 1 | 1 | ~2 Hz | AprilTag detection via camera (tag16h5 family) |
-| `mission_task` | 1 | 2 | — | State machine: arm → takeoff → explore → precision land |
+| `at_detect_task` | 1 | 1 | ~2 Hz | AprilTag detection via camera (tag16h5); detection only, never affects flight |
+| `mission_task` | 1 | 2 | — | State machine: CMD_START → arm → takeoff → laptop control → CMD_LAND (repeats) |
 | `camera_stream_task` | 0 | 1 | on demand | JPEG camera preview for `camera_stream.py` (started by `at_detect_task`) |
 
 **Camera**: two frame buffers (`fb_count=2`) shared by `at_detect_task` and `camera_stream_task`; both fetch via `camera_fb_get_fresh()` and return each buffer once. Internal RAM is tight: `esp-apriltag` allocates from PSRAM (`apriltag_psram_alloc.h`), and big buffers belong in PSRAM. `laptop/tag_stream.py` compiles the same `esp-apriltag` sources for the laptop so its overlay matches what the drone decodes; keep `at_detect.c`'s parameters and gate in sync with `laptop/apriltag_host.py`.
 
 **Setpoint ownership**: `mission_task` owns MAVLink setpoints during takeoff/landing. `nav_task` takes over when `nav_set_goal_ned()` is called. `nav_cancel()` returns ownership to mission.
 
-**Coordinate frames**: Everything uses NED (North-East-Down). PX4 odom origin is at takeoff. The `odom` module manages a translation-only `map_T_odom` transform, refined by AprilTag nav-tag sightings.
+**Coordinate frames**: Everything uses NED (North-East-Down). PX4 odom origin is at takeoff. The `odom` module manages a translation-only `map_T_odom` = the drone's `setup.yaml` start offset (fixed; tags never change it).
 
 ### Navigation pipeline
 

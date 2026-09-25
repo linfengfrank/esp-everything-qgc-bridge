@@ -45,13 +45,13 @@ typedef struct __attribute__((packed)) {
     float    heading_rad;                   /* NED CW positive (rad)            */
 
     uint8_t  nav_state;                     /* nav_state_t cast to uint8_t      */
-    int8_t   tag_id;                        /* last AprilTag ID, −1 if none     */
-    float    tag_dist_m;                    /* horizontal dist to tag (m)       */
+    int8_t   tag_id;                        /* claimed tag ID, −1 until one     */
+    float    tag_dist_m;                    /* camera range at last sighting (m)*/
 
     uint8_t  vfh_blocked[VFH_BINS];         /* 1 = blocked, 0 = free            */
     uint8_t  is_stuck;                      /* 1 = STUCK or RETREATING          */
 
-    uint16_t reloc_age_s;                   /* seconds since last nav-tag fix   */
+    uint16_t reloc_age_s;                   /* always 0xFFFF (no nav-tag fixes) */
 } wifi_telem_pkt_t;
 
 /* ---------------------------------------------------------------------------
@@ -79,9 +79,7 @@ typedef struct __attribute__((packed)) {
 #define WIFI_CMD_BUF_SIZE 1024
 
 /* ---------------------------------------------------------------------------
- * Navigation-tag position packet — received from laptop over UDP.
- * Tells the drone where known AprilTags are in the map frame so it can
- * correct its odometry when it detects them.
+ * Navigation-tag packet — start offset (map_T_odom) + nav-tag IDs.
  * --------------------------------------------------------------------------- */
 #define WIFI_MAX_NAV_TAGS   16
 
@@ -185,6 +183,11 @@ bool wifi_start_requested(void);
 
 /* Clear the start-request flag (call after acting on it). */
 void wifi_clear_start_request(void);
+
+/* Gates commands: START only when READY (→ BUSY), GOTO/TRAJ_START only when
+ * FLYING, LAND ignored when READY. */
+typedef enum { MISSION_BUSY, MISSION_READY, MISSION_FLYING } mission_phase_t;
+void wifi_set_mission_phase(mission_phase_t phase);
 
 /* Returns true while the WiFi link is up (IP obtained, not disconnected). */
 bool wifi_is_connected(void);
