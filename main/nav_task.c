@@ -266,6 +266,14 @@ static void traj_tick(void)
 /* ---------------------------------------------------------------------------
  * nav_tick — executed every 100 ms (10 Hz) by nav_task
  * --------------------------------------------------------------------------- */
+/* Goal from this tick's snapshot still active (no HOLD / new goal since)?
+ * Call with s_mutex held. */
+static bool goal_unchanged(const nav_internal_t *nav)
+{
+    return s_nav.has_goal && s_nav.goal_map_x == nav->goal_map_x
+                          && s_nav.goal_map_y == nav->goal_map_y;
+}
+
 static void nav_tick(const vfh_config_t *vfh_cfg)
 {
     /* Snapshot shared state */
@@ -293,8 +301,7 @@ static void nav_tick(const vfh_config_t *vfh_cfg)
 
     drone_state_t drone = mavlink_get_state();
 
-    /* Convert goal from map frame to odom frame every tick so that
-     * relocalization corrections are picked up immediately. */
+    /* Map → odom (fixed start offset). */
     float goal_x, goal_y;
     map_to_odom(nav.goal_map_x, nav.goal_map_y, &goal_x, &goal_y);
 
@@ -308,15 +315,17 @@ static void nav_tick(const vfh_config_t *vfh_cfg)
 
     /* ---- Check arrival ---- */
     if (dist < NAV_ARRIVE_RADIUS_M) {
-        mavlink_set_position_ned(goal_x, goal_y, nav.goal_z, drone.heading);
-        ESP_LOGI(TAG, "Goal reached (dist=%.2f m)", dist);
-
         xSemaphoreTake(s_mutex, portMAX_DELAY);
-        s_nav.state    = NAV_ARRIVED;
-        s_nav.has_goal = false;
-        s_status.state = NAV_ARRIVED;
-        s_status.dist_to_goal = dist;
+        bool ok = goal_unchanged(&nav);
+        if (ok) {
+            mavlink_set_position_ned(goal_x, goal_y, nav.goal_z, drone.heading);
+            s_nav.state    = NAV_ARRIVED;
+            s_nav.has_goal = false;
+            s_status.state = NAV_ARRIVED;
+            s_status.dist_to_goal = dist;
+        }
         xSemaphoreGive(s_mutex);
+        if (ok) ESP_LOGI(TAG, "Goal reached (dist=%.2f m)", dist);
         return;
     }
 
@@ -332,11 +341,14 @@ static void nav_tick(const vfh_config_t *vfh_cfg)
     float       new_steering    = 0.0f;
     uint32_t    new_stuck_count = nav.stuck_count;
 
-    /* Direct waypoint mode: command the exact target each tick. */
-    mavlink_set_position_ned(goal_x, goal_y, nav.goal_z, goal_ned_angle);
-
-    /* Write back under mutex */
+    /* Direct waypoint mode: command the exact target each tick, under the
+     * mutex so a racing HOLD / new goal can't be overwritten. */
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (!goal_unchanged(&nav)) {
+        xSemaphoreGive(s_mutex);
+        return;
+    }
+    mavlink_set_position_ned(goal_x, goal_y, nav.goal_z, goal_ned_angle);
     s_nav.state             = new_state;
     s_nav.prev_steering_rad = new_steering;
     s_nav.stuck_count       = new_stuck_count;
@@ -393,11 +405,13 @@ void nav_set_goal_map(float map_x, float map_y, float z)
 void nav_cancel(void)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool active    = s_nav.has_goal;
     s_nav.state    = NAV_IDLE;
     s_nav.has_goal = false;
     s_status.state = NAV_IDLE;
     xSemaphoreGive(s_mutex);
 
+    if (!active) return;   /* keep mission_task's setpoint (e.g. mid-climb) */
     mavlink_set_hold();
     ESP_LOGI(TAG, "Navigation cancelled — holding");
 }
@@ -494,7 +508,7 @@ void nav_task(void *arg)
         if (!wifi_is_connected()) {
             if (wifi_discon_tick == 0) {
                 wifi_discon_tick = xTaskGetTickCount();
-                nav_cancel();   /* hold position immediately — don't fly blind */
+                nav_cancel();   /* stop any goal/trajectory */
                 ESP_LOGW(TAG, "WiFi link lost — holding position, disarm in 3 s");
             } else if (!wifi_kill_sent &&
                        (xTaskGetTickCount() - wifi_discon_tick) >= pdMS_TO_TICKS(3000) &&
@@ -511,7 +525,7 @@ void nav_task(void *arg)
             }
         }
 
-        /* Skip navigation while WiFi is down — hold was already commanded */
+        /* Skip navigation while WiFi is down */
         if (wifi_discon_tick != 0) {
             vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(50));
             continue;

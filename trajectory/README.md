@@ -17,7 +17,7 @@ Run `ellipse_min_snap_demo.m` in MATLAB to regenerate the CSV and placement
 guide. Set `run_simulation = true` for the optional Simulink test.
 
 ```bash
-python3 laptop/send_trajectory.py --drone-id 22 --takeoff --takeoff-wait 12 \
+python3 laptop/send_trajectory.py --drone-id 22 --takeoff --takeoff-wait 12 --confirm \
     --trajectory trajectory/ellipse_min_snap_traj.csv
 ```
 
@@ -28,7 +28,7 @@ Run `circle_traj_demo.m` in MATLAB to regenerate the default clockwise circle:
 `x = 0..-2 m` and `y = -1..+1 m`.
 
 ```bash
-python3 laptop/send_trajectory.py --drone-id 22 --takeoff --takeoff-wait 12 \
+python3 laptop/send_trajectory.py --drone-id 22 --takeoff --takeoff-wait 12 --confirm \
     --trajectory trajectory/circle_traj.csv
 ```
 

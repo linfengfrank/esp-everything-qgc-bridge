@@ -5,12 +5,8 @@
 #   X = North, Y = East, Z = Down.
 #   All positions below are in this frame.
 #
-# The map frame is anchored by navigation AprilTags at surveyed positions.
-# When a drone sees a nav tag, it corrects its PX4 odometry via
-# VISION_POSITION_ESTIMATE, making PX4's local NED converge to map frame.
-#
-# start_x / start_y: where each drone powers on in map frame (metres).
-# Used by the laptop for crumb transforms before the first vision fix.
+# Map frame = PX4 local NED + the drone's start_x / start_y (not listed → 0,0).
+# Tags never correct it.
 
 drones:
   5:
@@ -88,11 +84,10 @@ stuck:
 
 # Navigation AprilTags at known map-frame positions.
 # These are sent to the drones at startup via CMD_SET_NAV_TAGS.
-# The drone uses them for odometry correction — NOT for landing.
+# The drone only uses the IDs (never claimed; no odometry correction).
 #
 # Key = AprilTag ID (tag16h5 family), value = map-frame position.
-# IDs 0–11 are reserved for landing targets — do NOT add them here.
-# Survey these positions carefully — odometry accuracy depends on it.
+# IDs 0–11 are the claimable (target) tags — do NOT add them here.
 nav_tags:
   12: {map_x: 0.0, map_y: -3.5}
   13: {map_x: 0.0, map_y: -1.5}

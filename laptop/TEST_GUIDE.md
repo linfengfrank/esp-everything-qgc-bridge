@@ -1,324 +1,96 @@
-# Arm, takeoff, hover and landing test
+# Arm, takeoff, hover and land test
 
-This test is based on the attached `esp-everything-qgc-bridge(1)` project.
-It uses the existing custom Python GCS protocol, not direct Pymavlink.
+`laptop/simple_arm_takeoff_land.py`: CMD_START → hover → CMD_HOLD → CMD_LAND.
+Run from the repo root. Examples use drone **22**; use your flashed ID.
 
-## Exact behavior in this project
+## Setup
 
-The command definitions are in `laptop/protocol.py` and `main/wifi_task.h`:
+- Flash with `./flash_drone.sh <id> <port>`. The ESP32 gets `192.168.1.(200+id)`
+  and sends telemetry only to `192.168.1.(100+id)`, so the laptop must hold that
+  address on the drone Wi-Fi (README, "Laptop IP address").
+- Python: README section 2.
+- Serial monitor: `idf.py -p <port> monitor`. Open it before arming (it resets
+  the ESP32). Wait for `Waiting for CMD_START from laptop...`.
+- QGroundControl: observe only.
+- Optional link check (close QGC first): `python3 laptop/check_px4_esp32_link.py --drone-id 22` → `RESULT: PASS ...`.
+- `camera_stream.py` / `tag_stream.py` can run alongside (use `--fps 5` in
+  flight). Tags never affect the flight. Start `tag_debug.py` only after the
+  flight script, because it takes UDP 5005.
 
-- `CMD_START = 0x05`
-- `CMD_HOLD = 0x03`
-- `CMD_LAND = 0x02`
+## Commands
 
-The flight sequence is implemented in `main/main.c`:
+| Command | ESP32 behaviour |
+|---------|-----------------|
+| `CMD_START` | Accepted once per flight, from `Pre-streaming hold setpoint...` on; otherwise ignored (`CMD_START ignored — not waiting for it`). OFFBOARD → arm (gives up after 10 s) → climb to 0.5 m. |
+| `CMD_HOLD` | Stops an active goal/trajectory; no effect otherwise. |
+| `CMD_LAND` | Any time after START: aborts OFFBOARD/arming, or lands (also mid-climb). Ignored before START. |
+| `CMD_GOTO`, trajectory start | Only after takeoff completes; otherwise ignored (`... ignored — not flying`). |
 
-1. Wait for valid PX4 telemetry.
-2. Pre-stream a hold setpoint for two seconds.
-3. Wait for `CMD_START` from the laptop.
-4. Require all ToF sensors to be initialized.
-5. Request PX4 Offboard mode.
-6. Arm PX4.
-7. Take off to `CRUISE_ALT_M = 0.5 m`.
-8. Wait for laptop navigation or landing commands.
-9. On `CMD_LAND`, send `MAV_CMD_NAV_LAND`.
-
-Therefore, the existing protocol does not provide separate ARM and TAKEOFF
-commands. `CMD_START` performs both.
-
-## Current network configuration
-
-The attached `sdkconfig` contains:
-
-```text
-Wi-Fi SSID: Mate20
-Laptop IP: 192.168.43.106
-Drone ID: 2
-Custom telemetry: ESP32 -> laptop UDP 5005
-Custom commands: laptop -> ESP32 UDP 5006
-QGroundControl telemetry: ESP32 -> laptop UDP 14550
-QGroundControl commands: laptop -> ESP32 UDP 8888
-```
-
-Verify the laptop IP before testing because a phone hotspot may assign a new
-address after reconnecting.
-
-## 1. Copy the script
-
-Copy:
-
-```text
-simple_arm_takeoff_land.py
-```
-
-into the project directory:
-
-```text
-esp-everything-qgc-bridge/laptop/
-```
-
-The result should be:
-
-```text
-laptop/
-├── comms.py
-├── protocol.py
-├── setup.yaml
-└── simple_arm_takeoff_land.py
-```
-
-## 2. Prepare Python
-
-Open a terminal in `laptop/`:
+## 1. Communication check
 
 ```bash
-cd esp-everything-qgc-bridge/laptop
-python -m pip install pyyaml
+python3 laptop/simple_arm_takeoff_land.py --drone-id 22 --monitor-only
 ```
 
-On Windows, `py` may be used instead of `python`.
+Expect `Connected: drone=22, ESP32_IP=192.168.1.222, ...`, then 15 s of
+`MONITOR | ... | nav=IDLE | age=...` with `age` well below 1 s. No flight commands are sent.
 
-## 3. Verify the ESP32 firmware mode
+If it fails with `No telemetry from drone 22 on UDP 5005 (heard drones: [...])`:
+another ID listed → wrong `--drone-id`; `none` → check the laptop IP and firewall.
 
-Use the normal firmware from the attached project. The ESP32 must continue to
-send the 20 Hz Offboard setpoint stream in `main/mavlink_task.c`.
-
-Do not enable a modified direct-laptop-MAVLink mode that disables
-`send_setpoint()`, because the existing custom Python GCS depends on the ESP32
-for Offboard setpoint streaming.
-
-## 4. Start the hardware and monitoring tools
-
-Recommended order:
-
-1. Remove propellers for the first bench test.
-2. Power PX4 and ESP32.
-3. Connect the laptop and ESP32 to `Mate20`.
-4. Start the ESP32 serial monitor:
+## 2. Props-off test, then flight
 
 ```bash
-idf.py monitor
+python3 laptop/simple_arm_takeoff_land.py --drone-id 22
 ```
 
-5. Open QGroundControl for observation.
-6. Do not use QGroundControl to arm or change modes during the Python test.
+Type `ARM-22`. The script sends CMD_START, waits `--takeoff-wait` (12 s), sends
+CMD_HOLD, waits `--hover-time` (5 s), sends CMD_LAND and exits.
 
-Expected ESP32 startup messages include:
+Key ESP32 lines (others interleave):
 
 ```text
-Telemetry valid
-Pre-streaming hold setpoint for 2 s...
-Waiting for CMD_START from laptop...
-Telemetry -> 192.168.43.106:5005 | Commands <- port 5006
+mission: CMD_START received
+mission: ToF disabled (TOF_ENABLED=0) — skipping pre-arm sensor check
+mission: OFFBOARD mode confirmed
+mission: Armed confirmed
+mission: Taking off to 0.5 m AGL (NED z=-0.50)...
+mission: Altitude reached: NED z=-0.3x (target=-0.50)
+mission: Exploration mode — waiting for laptop goals...
+wifi: CMD_HOLD
+wifi: CMD_LAND
+mission: CMD_LAND received from laptop
+mission: Land command sent
+mission: Disarmed — mission complete
+mission: Mission loop complete — waiting for next CMD_START
 ```
 
-## 5. Quick PX4-ESP32 link check
+- Props off: `Takeoff timeout: NED z=0.0x ...` replaces `Altitude reached` (expected).
+- `Takeoff aborted: OFFBOARD refused (check QGC)` / `arming refused (check QGC)`:
+  PX4 rejected it. Fix the cause in QGC and run again.
+- `Still armed after 20 s — land with RC`: take over and land with the RC.
 
-Before running the mission script, run this connectivity check from the project
-root:
+In flight, watch QGC: Offboard → armed → ~0.5 m → steady hover → Land → disarmed.
 
-```bash
-python laptop/check_px4_esp32_link.py
-```
+## 3. Emergency
 
-Or, if your terminal is already in `laptop/`:
+- **RC pilot first:** switch out of Offboard or use the kill switch. The ESP32
+  never overrides this. After an RC landing it logs `Disarmed without CMD_LAND`
+  and is ready for the next START.
+- **Ctrl+C** after START sends CMD_LAND (3×): it aborts arming, or lands the
+  drone, even mid-climb. Stale telemetry (3 s) does the same.
+- If the script or laptop dies without sending LAND, the drone keeps hovering: use the RC.
+- **Wi-Fi killswitch:** if the ESP32 loses the access point it holds position,
+  and after 3 s sends a non-forced disarm. PX4 normally refuses this in the air
+  (`Disarming denied: not landed`), so take over with the RC.
 
-```bash
-python check_px4_esp32_link.py
-```
+## 4. Repeat
 
-## 6. Communication-only test
+No reboot needed. Wait for `Waiting for CMD_START from laptop...` and run again.
 
-Run:
+## Limitations
 
-```bash
-python simple_arm_takeoff_land.py --drone-id 2 --monitor-only
-```
-
-Expected Python output:
-
-```text
-Waiting for drone 2 telemetry on UDP 5005...
-Connected: drone=2, ESP32_IP=..., map=(...), nav=IDLE
-MONITOR | remaining ... | map=(...) | nav=IDLE | age=...
-```
-
-Do not proceed if:
-
-- no telemetry is received;
-- the packet age repeatedly exceeds one second;
-- the drone ID is not 2;
-- the ESP32 reports Wi-Fi or PX4 telemetry problems.
-
-### If telemetry is not received
-
-Check:
-
-```powershell
-ipconfig
-```
-
-The active laptop Wi-Fi address must match:
-
-```text
-CONFIG_HOST_IPV4_ADDR="192.168.43.106"
-```
-
-If it does not match, update it through `idf.py menuconfig`, rebuild, and flash.
-Also allow Python through Windows Defender Firewall on private networks.
-
-## 7. Propellers-removed command test
-
-With propellers removed, run:
-
-```bash
-python simple_arm_takeoff_land.py --drone-id 2
-```
-
-Alternative command path using the simple goal script:
-
-```bash
-python simple_arm_set_goal.py --drone-id 2 --goal-x -2.0 --goal-y 5.0 --confirm
-```
-
-The program waits for telemetry and asks:
-
-```text
-Type ARM-2 to start the test:
-```
-
-Enter:
-
-```text
-ARM-2
-```
-
-The Python program sends:
-
-```text
-CMD_START
-```
-
-The expected ESP32 log sequence is:
-
-```text
-CMD_START
-CMD_START received — checking ToF sensors...
-All ... ToF sensors OK — proceeding to arm
-Requesting OFFBOARD mode...
-OFFBOARD mode confirmed
-Arming...
-Armed confirmed
-Taking off to 0.5 m AGL...
-```
-
-Because the propellers are removed, this is only a communication and command
-acceptance test. Use the remote controller or PX4 safety procedures as needed
-to ensure the vehicle is disarmed before touching it.
-
-## 8. Supervised low-altitude flight test
-
-Conduct this only in an approved clear test area with appropriate supervision
-and a manual recovery method.
-
-Run:
-
-```bash
-python simple_arm_takeoff_land.py \
-  --drone-id 2 \
-  --takeoff-wait 12 \
-  --hover-time 5
-```
-
-```bash
-python simple_arm_takeoff_land.py  --drone-id 2  --takeoff-wait 12  --hover-time 5
-```
-
-
-Simple waypoint flight command:
-
-```bash
-python simple_waypoint_mission.py \
-  --drone-id 2 \
-  --waypoints-file waypoints_example.txt \
-  --takeoff-wait 5.0 \
-  --arrival-timeout 30.0 \
-  --confirm
-```
-
-```bash
-python simple_waypoint_mission.py --drone-id 2 --waypoints-file waypoints_example.txt --takeoff-wait 5.0  --arrival-timeout 30.0  --confirm
-```
-
-```bash
-python simple_waypoint_mission.py --drone-id 2 --waypoints-file waypoints_example.txt --takeoff-wait 5.0 --arrival-timeout 30.0 --confirm --live-telem
-```
-
-Sequence:
-
-1. Type `ARM-2`.
-2. Python sends `CMD_START`.
-3. ESP32 requests Offboard, arms, and commands NED `z = -0.5 m`.
-4. Python waits 12 seconds and reports horizontal telemetry.
-5. Python sends `CMD_HOLD`.
-6. The UAV holds for five seconds.
-7. Python sends `CMD_LAND`.
-
-During the test, observe in QGroundControl:
-
-- flight mode becomes Offboard;
-- vehicle becomes armed;
-- altitude rises to about 0.5 m;
-- horizontal position remains stable;
-- vehicle descends after `CMD_LAND`;
-- vehicle disarms after touchdown.
-
-Expected final ESP32 messages:
-
-```text
-CMD_LAND
-CMD_LAND received from laptop
-LAND command sent
-Disarmed — mission complete
-```
-
-## 9. Emergency interruption
-
-Pressing `Ctrl+C` after `CMD_START` makes the Python program attempt to send
-`CMD_LAND` before closing.
-
-This is only a software fallback. Keep the supervised manual recovery method
-ready throughout the test.
-
-## 10. Repeating the test
-
-After landing, `mission_task` ends with:
-
-```c
-vTaskDelete(NULL);
-```
-
-The ESP32 continues sending telemetry, but it will no longer process another
-full start sequence in `mission_task`. Before a second flight:
-
-1. Confirm touchdown and disarming.
-2. Stop the Python program.
-3. Reset or power-cycle the ESP32.
-4. Wait until the log again shows `Waiting for CMD_START from laptop...`.
-5. Restart the Python program.
-
-## 10. Important telemetry limitation
-
-The existing custom telemetry contains horizontal position, heading,
-navigation state, AprilTag information, VFH state, and relocation age.
-It does not contain:
-
-- altitude;
-- armed state;
-- PX4 flight mode;
-- battery status;
-- command acknowledgements.
-
-Consequently, this simple Python script cannot independently verify takeoff or
-landing completion. QGroundControl and the ESP32 serial log are used only to
-observe those states during the initial tests.
+- Telemetry has no altitude, armed state or flight mode: use QGC and the serial monitor.
+- Commands are not acknowledged: check `wifi: CMD_...` in the serial monitor.
+- A START sent too early is ignored. The script can't tell, so check the serial monitor.
+- `tag_id` / `tag_dist_m` in telemetry are info only, latched until the ESP32 reboots.

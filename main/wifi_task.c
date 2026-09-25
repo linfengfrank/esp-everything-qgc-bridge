@@ -31,6 +31,7 @@ static const char *TAG = "wifi";
 
 static volatile bool s_land_requested  = false;
 static volatile bool s_start_requested = false;
+static volatile mission_phase_t s_phase = MISSION_BUSY;
 static volatile bool s_wifi_connected  = false;
 static volatile bool s_camera_stream_requested = false;
 static volatile uint32_t s_camera_stream_keepalive_ms = 0;
@@ -148,9 +149,6 @@ void wifi_task_init(void)
 }
 
 /* ---------------------------------------------------------------------------
- * wifi_task — 10 Hz telemetry loop
- * --------------------------------------------------------------------------- */
-/* ---------------------------------------------------------------------------
  * Process an incoming command packet from the laptop
  * --------------------------------------------------------------------------- */
 static void handle_command(const wifi_cmd_pkt_t *cmd)
@@ -160,14 +158,27 @@ static void handle_command(const wifi_cmd_pkt_t *cmd)
 
     switch (cmd->cmd_type) {
     case CMD_START:
-        ESP_LOGI(TAG, "CMD_START");
+        if (s_phase != MISSION_READY) {
+            ESP_LOGW(TAG, "CMD_START ignored — not waiting for it");
+            break;
+        }
+        s_phase = MISSION_BUSY;   /* one START per flight */
         s_start_requested = true;
+        ESP_LOGI(TAG, "CMD_START");
         break;
     case CMD_GOTO:
+        if (s_phase != MISSION_FLYING) {
+            ESP_LOGW(TAG, "CMD_GOTO ignored — not flying");
+            break;
+        }
         nav_set_goal_map(cmd->goal_x, cmd->goal_y, -(WIFI_CRUISE_ALT_M));
         ESP_LOGI(TAG, "CMD_GOTO map(%.2f,%.2f)", cmd->goal_x, cmd->goal_y);
         break;
     case CMD_LAND:
+        if (s_phase == MISSION_READY) {
+            ESP_LOGW(TAG, "CMD_LAND ignored — not flying");
+            break;
+        }
         ESP_LOGI(TAG, "CMD_LAND");
         s_land_requested = true;
         break;
@@ -295,6 +306,10 @@ static void handle_traj_data(const uint8_t *buf, int len)
 static void handle_traj_start(const uint8_t *buf, int len)
 {
     if (len < 5) return;
+    if (s_phase != MISSION_FLYING) {
+        ESP_LOGW(TAG, "CMD_TRAJ_START ignored — not flying");
+        return;
+    }
     uint16_t dt_ms;
     memcpy(&dt_ms, buf + 3, sizeof(dt_ms));
     nav_traj_start(buf[2], dt_ms);
@@ -415,8 +430,7 @@ void wifi_task(void *arg)
         pkt.nav_state   = (uint8_t)ns.state;
         pkt.is_stuck    = (ns.state == NAV_STUCK) ? 1 : 0;
 
-        /* AprilTag — always send the latched tag ID (−1 if none found yet).
-         * tag_dist_m comes from live pose when available. */
+        /* AprilTag (info only): claim latched since boot, range at last sighting */
         pkt.tag_id = at_detect_my_tag_id();
         if (pose.valid) {
             pkt.tag_dist_m = sqrtf(pose.tx * pose.tx + pose.tz * pose.tz);
@@ -428,7 +442,7 @@ void wifi_task(void *arg)
         for (int b = 0; b < VFH_BINS; b++)
             pkt.vfh_blocked[b] = ns.vfh_blocked[b] ? 1 : 0;
 
-        pkt.reloc_age_s = odom_reloc_age_s();
+        pkt.reloc_age_s = 0xFFFF;   /* never relocalised */
 
         /* ---- Send telemetry ---- */
         send(tx_sock, &pkt, sizeof(pkt), 0);
@@ -510,6 +524,11 @@ bool wifi_start_requested(void)
 void wifi_clear_start_request(void)
 {
     s_start_requested = false;
+}
+
+void wifi_set_mission_phase(mission_phase_t phase)
+{
+    s_phase = phase;
 }
 
 bool wifi_is_connected(void)

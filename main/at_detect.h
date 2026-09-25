@@ -13,7 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-/* Run AprilTag detection on Core 1 at low priority to avoid starving control loops. */
+/* Core 1, low priority.  Detection only — never affects flight. */
 #define AT_TASK_CORE        1
 #define AT_TASK_PRIORITY    1
 #define AT_TASK_STACK       12288
@@ -25,12 +25,6 @@
 
 void at_detect_init(void);
 void at_detect_task(void* pvParams);
-bool at_detect_land_requested(void);
-void at_detect_clear_land_request(void);
-int at_detect_last_id(void);
-
-/* Reset the latched tag so a new tag can be found during re-exploration. */
-void at_detect_reset_latch(void);
 
 /* Latched tag ID this drone found (−1 if none yet). Set once, never overwritten. */
 int8_t at_detect_my_tag_id(void);
@@ -39,17 +33,11 @@ int8_t at_detect_my_tag_id(void);
  * Entries equal to −1 are ignored. Thread-safe. */
 void at_detect_set_known_tags(const int8_t *ids, int count);
 
-/* Pose of the detected tag in camera frame (metres).
- * Camera convention: X = right, Y = down, Z = forward (into scene).
- * Use at_detect_get_pose() to get a thread-safe snapshot. */
+/* Claimed tag's pose at its last good sighting (camera frame, m; never
+ * cleared).  X = right, Y = down, Z = forward.  Read via at_detect_get_pose(). */
 typedef struct {
     float tx, ty, tz;   /* translation from camera origin to tag centre */
-    bool  valid;        /* true only when a low-error estimate exists    */
-    int   tag_id;
-    float    drone_x;      /* drone odom position at time of detection     */
-    float    drone_y;
-    float    drone_heading; /* drone heading at time of detection (rad)    */
-    uint32_t detect_ms;    /* esp_timer milliseconds at detection time     */
+    bool  valid;        /* true once a low-error estimate exists         */
 } at_detect_pose_t;
 
 /* Thread-safe snapshot of the latest pose estimate.
@@ -80,10 +68,3 @@ typedef struct {
 /* Thread-safe snapshot of all detections in the most recent camera frame.
  * frame_ms == 0 until the first frame has been processed. */
 at_live_dets_t at_detect_get_live(void);
-
-
-void camera_to_ned(float tx, float ty, float tz,
-                           float heading,
-                           float *out_dn,      /* NED north offset to tag (m) */
-                           float *out_de,      /* NED east  offset to tag (m) */
-                           float *out_hdist);   /* horizontal distance to tag  */
