@@ -62,7 +62,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Upload a CSV trajectory to one drone and fly it")
     ap.add_argument("--drone-id", type=int, required=True)
     ap.add_argument("--trajectory", required=True, help="CSV with columns t,x,y,z (s, NED m)")
-    ap.add_argument("--config", default="laptop/setup.yaml", help="Fleet config (optional)")
+    ap.add_argument("--config", default=str(Path(__file__).with_name("setup.yaml")),
+                    help="Fleet config (optional)")
     ap.add_argument("--dt", type=float, default=0.05,
                     help="Upload sample period (s); 0.05 = ESP nav loop rate")
     ap.add_argument("--max-speed", type=float, default=0.30,
@@ -149,13 +150,15 @@ def main() -> None:
         log.info("trajectory ended, nav state %s", latest["pkt"].nav_state_name)
 
         if args.finish == "land":
-            send(CMD_LAND, "CMD_LAND")
+            for _ in range(3):   # UDP: repeat LAND
+                send(CMD_LAND, "CMD_LAND")
         else:
             send(CMD_HOLD, "CMD_HOLD")
     except (Exception, KeyboardInterrupt):
         if flying:
             log.error("aborted — sending CMD_LAND")
-            comms.send_command(args.drone_id, CommandPacket(CMD_LAND))
+            for _ in range(3):
+                comms.send_command(args.drone_id, CommandPacket(CMD_LAND))
         raise
     finally:
         comms.stop()

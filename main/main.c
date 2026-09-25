@@ -1,7 +1,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "mavlink_task.h"
 #include "tof_task.h"
@@ -14,35 +13,35 @@
 
 static const char *TAG = "mission";
 
-#define PRECISION_APPROACH_S     10     /* max seconds to fly to tag position     */
-
 /* ---------------------------------------------------------------------------
  * Test parameters — adjust before flight
  * --------------------------------------------------------------------------- */
 #define CRUISE_ALT_M        0.5f    /* target altitude above takeoff (m)        */
-#define GOAL_OFFSET_X_M     2.0f    /* goal North offset from takeoff (m)       */
-#define GOAL_OFFSET_Y_M     1.6f    /* goal East  offset from takeoff (m)       */
+#define ARM_TIMEOUT_S       10      /* give up on OFFBOARD + arm (s)            */
 #define TAKEOFF_TIMEOUT_S   10      /* max seconds to wait for altitude (s)     */
-#define LAND_TIMEOUT_S      20      /* max seconds to wait for disarm (s)       */
+#define LAND_TIMEOUT_S      20      /* warn if still armed after landing (s)    */
 #define ALT_TOLERANCE_M     0.15f   /* altitude band considered "at altitude"   */
 
+/* Consume a pending CMD_LAND. */
+static bool land_requested(void)
+{
+    if (!wifi_land_requested()) return false;
+    wifi_clear_land_request();
+    ESP_LOGI(TAG, "CMD_LAND received from laptop");
+    return true;
+}
+
 /* ---------------------------------------------------------------------------
- * Mission task — runs once, handles full flight sequence
- *
- * Sequencing contract with nav_task:
- *   1. nav_task is idle (no goal) — mission_task owns the MAVLink setpoint
- *   2. nav_set_goal_map() is called — nav_task takes over setpoints
- *   3. nav_cancel() restores ownership to mission_task for landing
+ * Mission task: START → OFFBOARD → arm → takeoff → laptop control → LAND,
+ * repeat.  Owns the setpoint until a GOTO/trajectory; nav_cancel() returns it.
  * --------------------------------------------------------------------------- */
 static void mission_task(void *arg)
 {
-    bool  nav_goal_active = false;
     float target_z   = -(CRUISE_ALT_M);   /* NED: negative = above ground */
     float takeoff_x  = 0.0f;
     float takeoff_y  = 0.0f;
 
     for (;;) {
-        nav_goal_active = false;
 
     /* ------------------------------------------------------------------ */
     /* Phase 1: Wait for valid telemetry                                   */
@@ -61,11 +60,15 @@ static void mission_task(void *arg)
     /* accept an OFFBOARD mode switch.  Stream for 2 s.                    */
     /* ------------------------------------------------------------------ */
     mavlink_set_hold();
+    nav_cancel();                 /* drop stale goal + commands */
+    wifi_clear_start_request();
+    wifi_clear_land_request();
+    wifi_set_mission_phase(MISSION_READY);
     ESP_LOGI(TAG, "Pre-streaming hold setpoint for 2 s...");
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     /* ------------------------------------------------------------------ */
-    /* Phase 2b: Wait for CMD_START from laptop                           */
+    /* Phase 2b: Wait for CMD_START (wifi_task switches to BUSY on it)     */
     /* ------------------------------------------------------------------ */
     ESP_LOGI(TAG, "Waiting for CMD_START from laptop...");
     while (!wifi_start_requested()) {
@@ -74,11 +77,7 @@ static void mission_task(void *arg)
     wifi_clear_start_request();
     ESP_LOGI(TAG, "CMD_START received");
 
-    /* ------------------------------------------------------------------ */
-    /* Pre-arm safety: require all ToF sensors to be initialised.          */
-    /* If any sensor failed, refuse to arm — flying without full obstacle  */
-    /* coverage is too dangerous.  Log every 2 s so the issue is obvious.  */
-    /* ------------------------------------------------------------------ */
+    /* Pre-arm: refuse to arm until all ToF sensors are up. */
 #if TOF_ENABLED
     {
         ESP_LOGI(TAG, "Checking ToF sensors...");
@@ -96,40 +95,38 @@ static void mission_task(void *arg)
 #endif
 
     /* ------------------------------------------------------------------ */
-    /* Phase 3a: Switch to OFFBOARD mode                                   */
-    /* Retry every 500 ms until PX4 confirms via heartbeat custom_main_mode */
+    /* Phase 3: OFFBOARD, then arm — retry every 500 ms.                   */
+    /* CMD_LAND or ARM_TIMEOUT_S aborts and returns to waiting.            */
     /* ------------------------------------------------------------------ */
+    const char *abort_why = NULL;
+    int tries = ARM_TIMEOUT_S * 2;
+
     ESP_LOGI(TAG, "Requesting OFFBOARD mode...");
-    while (1) {
-        if (at_detect_land_requested()) goto precision_landing;
+    while (mavlink_get_state().custom_main_mode != PX4_MAIN_MODE_OFFBOARD) {
+        if (land_requested())  { abort_why = "CMD_LAND"; break; }
+        if (tries-- == 0)      { abort_why = "OFFBOARD refused (check QGC)"; break; }
         mavlink_set_offboard_mode();
         vTaskDelay(pdMS_TO_TICKS(500));
-        if (mavlink_get_state().custom_main_mode == PX4_MAIN_MODE_OFFBOARD) {
-            ESP_LOGI(TAG, "OFFBOARD mode confirmed");
-            break;
-        }
-        ESP_LOGW(TAG, "OFFBOARD not set yet — retrying");
     }
-
-    /* ------------------------------------------------------------------ */
-    /* Phase 3b: Arm                                                        */
-    /* Retry every 500 ms until PX4 confirms armed via heartbeat           */
-    /* ------------------------------------------------------------------ */
-    ESP_LOGI(TAG, "Arming...");
-    while (1) {
-        // if (at_detect_land_requested()) goto precision_landing;
+    if (!abort_why) {
+        ESP_LOGI(TAG, "OFFBOARD mode confirmed");
+        ESP_LOGI(TAG, "Arming...");
+    }
+    while (!abort_why && !mavlink_get_state().armed) {
+        if (land_requested())  { abort_why = "CMD_LAND"; break; }
+        if (tries-- == 0)      { abort_why = "arming refused (check QGC)"; break; }
         mavlink_arm(true);
         vTaskDelay(pdMS_TO_TICKS(500));
-        if (mavlink_get_state().armed) {
-            ESP_LOGI(TAG, "Armed confirmed");
-            break;
-        }
-        ESP_LOGW(TAG, "Not armed yet — retrying");
     }
+    if (abort_why) {
+        mavlink_arm(false);   /* in case the arm just went through */
+        ESP_LOGW(TAG, "Takeoff aborted: %s", abort_why);
+        continue;
+    }
+    ESP_LOGI(TAG, "Armed confirmed");
 
     /* ------------------------------------------------------------------ */
-    /* Phase 4: Take off to cruise altitude                                */
-    /* nav_task is still IDLE — mission_task owns the setpoint.            */
+    /* Phase 4: Take off (mission_task owns the setpoint); CMD_LAND lands  */
     /* ------------------------------------------------------------------ */
     {
         drone_state_t st = mavlink_get_state();
@@ -139,137 +136,59 @@ static void mission_task(void *arg)
     }
     ESP_LOGI(TAG, "Taking off to %.1f m AGL (NED z=%.2f)...", CRUISE_ALT_M, target_z);
 
-    for (int i = 0; i < TAKEOFF_TIMEOUT_S * 10; i++) {
-        if (fabsf(mavlink_get_state().z - target_z) < ALT_TOLERANCE_M) break;
+    bool land_now = false;
+    for (int i = 0; i < TAKEOFF_TIMEOUT_S * 10 && !land_now; i++) {
+        drone_state_t st = mavlink_get_state();
+        if (!st.armed || fabsf(st.z - target_z) < ALT_TOLERANCE_M) break;
+        land_now = land_requested();
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    ESP_LOGI(TAG, "Altitude reached: NED z=%.2f (target=%.2f)",
-             mavlink_get_state().z, target_z);
 
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    bool armed = mavlink_get_state().armed;
+    if (!armed) ESP_LOGW(TAG, "Disarmed without CMD_LAND");
 
     /* ------------------------------------------------------------------ */
-    /* Phase 5: Laptop-driven exploration                                 */
-    /* Goals arrive via CMD_GOTO from the laptop (handled in wifi_task).  */
-    /* This loop just monitors for landing triggers.                       */
+    /* Phase 5: Laptop control (GOTO / HOLD / trajectory) until LAND      */
     /* ------------------------------------------------------------------ */
-explore_loop:
-    nav_goal_active = true;   /* wifi_task owns nav goals from here */
-    ESP_LOGI(TAG, "Exploration mode — waiting for laptop goals...");
-
-    while (1) {
-        if (at_detect_land_requested()) goto precision_landing;
-        if (wifi_land_requested()) {
-            wifi_clear_land_request();
-            ESP_LOGI(TAG, "CMD_LAND received from laptop");
-            nav_goal_active = false;
-            goto do_land;
+    if (!land_now && armed) {
+        float z = mavlink_get_state().z;
+        if (fabsf(z - target_z) < ALT_TOLERANCE_M) {
+            ESP_LOGI(TAG, "Altitude reached: NED z=%.2f (target=%.2f)", z, target_z);
+        } else {
+            ESP_LOGW(TAG, "Takeoff timeout: NED z=%.2f (target=%.2f)", z, target_z);
         }
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
+        vTaskDelay(pdMS_TO_TICKS(1000));
 
-    /* ------------------------------------------------------------------ */
-    /* Phase 6a: Fly to tag position, refreshing pose on each detection   */
-    /* Times out after 60 s and returns to exploration.                    */
-    /* ------------------------------------------------------------------ */
-precision_landing:
-    ESP_LOGI(TAG, "Precision landing: tag %d", at_detect_last_id());
-
-    if (nav_goal_active || nav_get_status().state != NAV_IDLE) {
-        nav_cancel();
-        nav_goal_active = false;
-    }
-    vTaskDelay(pdMS_TO_TICKS(200));
-
-    {
-#define PRECISION_TIMEOUT_MS  30000
-#define POSE_UPDATE_THRESH_M  0.15f
-
-        uint32_t pl_start_ms  = (uint32_t)(esp_timer_get_time() / 1000);
-        uint32_t last_detect_ms = 0;
-        float    goal_x = mavlink_get_state().x;
-        float    goal_y = mavlink_get_state().y;
-
-        /* Seed goal from first available pose */
-        {
-            at_detect_pose_t p0 = at_detect_get_pose();
-            if (p0.valid) {
-                float dn, de, hdist;
-                camera_to_ned(p0.tx, p0.ty, p0.tz, p0.drone_heading,
-                              &dn, &de, &hdist);
-                float odom_x = p0.drone_x + dn;
-                float odom_y = p0.drone_y + de;
-                odom_to_map(odom_x, odom_y, &goal_x, &goal_y);
-                last_detect_ms = p0.detect_ms;
-                ESP_LOGI(TAG, "Initial tag map (%.2f, %.2f), hdist=%.2f m",
-                         goal_x, goal_y, hdist);
-            } else {
-                ESP_LOGW(TAG, "No valid pose yet — will refine when tag seen");
-                odom_to_map(goal_x, goal_y, &goal_x, &goal_y);
-            }
-        }
-        nav_set_goal_map(goal_x, goal_y, target_z);
-
-        for (;;) {
-            /* Check timeout */
-            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-            if ((now_ms - pl_start_ms) >= PRECISION_TIMEOUT_MS) {
-                ESP_LOGW(TAG, "Precision landing timed out — returning to exploration");
-                nav_cancel();
-                at_detect_reset_latch();
-                goto explore_loop;
-            }
-
-            /* Check for a fresh pose reading — but stop updating once
-             * we're close to the goal.  Pose updates call nav_set_goal_map
-             * which resets nav state to NAV_ROTATING, preventing arrival. */
-            nav_status_t ns = nav_get_status();
-            bool close_enough = ns.dist_to_goal < NAV_ARRIVE_RADIUS_M * 2.0f;
-
-            at_detect_pose_t pose = at_detect_get_pose();
-            if (!close_enough && pose.valid && pose.detect_ms != last_detect_ms) {
-                last_detect_ms = pose.detect_ms;
-                float dn, de, hdist;
-                camera_to_ned(pose.tx, pose.ty, pose.tz, pose.drone_heading,
-                              &dn, &de, &hdist);
-                float odom_x = pose.drone_x + dn;
-                float odom_y = pose.drone_y + de;
-                float map_x, map_y;
-                odom_to_map(odom_x, odom_y, &map_x, &map_y);
-                float dx = map_x - goal_x;
-                float dy = map_y - goal_y;
-                if (sqrtf(dx*dx + dy*dy) > POSE_UPDATE_THRESH_M) {
-                    goal_x = map_x;
-                    goal_y = map_y;
-                    nav_set_goal_map(goal_x, goal_y, target_z);
-                    ESP_LOGI(TAG, "Pose updated → map (%.2f, %.2f), hdist=%.2f m",
-                             goal_x, goal_y, hdist);
-                }
-            }
-
-            if (ns.state == NAV_ARRIVED) {
-                ESP_LOGI(TAG, "Above tag — landing");
-                nav_cancel();
+        wifi_set_mission_phase(MISSION_FLYING);
+        ESP_LOGI(TAG, "Exploration mode — waiting for laptop goals...");
+        while (!land_requested()) {
+            if (!mavlink_get_state().armed) {   /* landed by RC / QGC */
+                ESP_LOGW(TAG, "Disarmed without CMD_LAND");
                 break;
             }
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(200));
         }
+        wifi_set_mission_phase(MISSION_BUSY);
     }
 
     /* ------------------------------------------------------------------ */
-    /* Phase 6b: Land                                                       */
+    /* Phase 6: Land, wait for disarm.  LAND is (re)sent every 2 s only    */
+    /* while in OFFBOARD, so an RC takeover is never overridden.           */
     /* ------------------------------------------------------------------ */
-do_land:
-    mavlink_send_land_command();
-    ESP_LOGI(TAG, "Land command sent (tag %d)", at_detect_last_id());
-
-    for (int i = 0; i < LAND_TIMEOUT_S * 10; i++) {
-        if (!mavlink_get_state().armed) {
-            ESP_LOGI(TAG, "Disarmed — mission complete");
-            break;
+    nav_cancel();
+    for (int i = 0; mavlink_get_state().armed; i++) {
+        bool offboard = mavlink_get_state().custom_main_mode == PX4_MAIN_MODE_OFFBOARD;
+        if (i % 20 == 0 && offboard) {
+            mavlink_send_land_command();
+            if (i == 0) ESP_LOGI(TAG, "Land command sent");
+        }
+        if (i == 0 && !offboard) ESP_LOGW(TAG, "Not in OFFBOARD — RC has control, LAND not sent");
+        if (i == LAND_TIMEOUT_S * 10) {
+            ESP_LOGW(TAG, "Still armed after %d s — land with RC", LAND_TIMEOUT_S);
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     }
+    ESP_LOGI(TAG, "Disarmed — mission complete");
 
     ESP_LOGI(TAG, "Mission loop complete — waiting for next CMD_START");
     }
@@ -314,7 +233,7 @@ void app_main(void)
         NULL, WIFI_TASK_PRIORITY, NULL, WIFI_TASK_CORE
     );
 
-    /* Core 1: navigator (Pri 3) + mission (Pri 2)
+    /* Core 1: navigator + AprilTag + mission
      * nav_task preempts mission_task on Core 1 when it has work. */
     xTaskCreatePinnedToCore(
         nav_task, "nav", NAV_TASK_STACK,

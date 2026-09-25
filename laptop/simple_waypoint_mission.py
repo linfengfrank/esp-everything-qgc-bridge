@@ -2,22 +2,22 @@
 """
 Simple GCS mission: arm/takeoff -> fly through waypoints -> land.
 
-This script uses the existing custom UDP protocol already implemented by the
-laptop-side GCS:
-  - CMD_START : arm + take off to the firmware's default cruise altitude
-  - CMD_GOTO  : send a map-frame waypoint target
+Custom UDP commands (see protocol.py):
+  - CMD_START : arm + take off to the firmware's cruise altitude
+  - CMD_GOTO  : fly to a map-frame (x, y); resent until the drone acts on it
   - CMD_LAND  : land in place
 
-Example:
-    python laptop/simple_waypoint_mission.py \
-        --drone-id 2 \
-        --waypoint 0.0,0.0 \
-        --waypoint 1.0,0.5 \
-        --waypoint 2.0,0.0
+Waypoints are relative to the takeoff point unless --map-frame is given,
+in which case they are arena coordinates and setup.yaml's start offset is sent.
 
-    python laptop/simple_waypoint_mission.py \
-        --drone-id 2 \
-        --waypoints-file missions/waypoints.txt
+Example:
+    python3 laptop/simple_waypoint_mission.py --drone-id 22 --confirm \
+        --waypoint 0.5,0.0 --waypoint=-0.5,0.5
+
+    python3 laptop/simple_waypoint_mission.py --drone-id 22 --confirm \
+        --waypoints-file waypoints/waypoints_example.txt
+
+Exit code: 0 all waypoints reached, 1 error or waypoint timeout, 130 Ctrl+C.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import argparse
 import logging
 import math
 import signal
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -38,7 +39,9 @@ from protocol import (
     CMD_HOLD,
     CMD_LAND,
     CMD_START,
-    NAV_ARRIVED,
+    NAV_FLYING,
+    NAV_ROTATING,
+    NAV_STUCK,
     CommandPacket,
     TelemetryPacket,
 )
@@ -49,6 +52,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("simple_waypoint_mission")
+
+GOTO_RESEND_S = 2.0   # resend CMD_GOTO if the drone hasn't started on it
 
 
 @dataclass
@@ -77,17 +82,10 @@ class TelemetryTracker:
             )
             self._condition.notify_all()
 
-            # Always show live position updates as soon as telemetry is received.
-            #log.info(
-            #    "Telemetry position: x=%.2f y=%.2f",
-            #    packet.ned_x,
-            #    packet.ned_y,
-            #)
-
             if self._print_live:
                 tag_text = "none" if packet.tag_id < 0 else str(packet.tag_id)
                 log.info(
-                    "TELEM drone=%d pos=(%.2f, %.2f) heading=%.2f state=%s tag=%s dist=%.2f stuck=%s reloc=%ds",
+                    "TELEM drone=%d pos=(%.2f, %.2f) heading=%.2f state=%s tag=%s dist=%.2f stuck=%s",
                     packet.drone_id,
                     packet.ned_x,
                     packet.ned_y,
@@ -96,7 +94,6 @@ class TelemetryTracker:
                     tag_text,
                     packet.tag_dist_m,
                     "yes" if packet.is_stuck else "no",
-                    packet.reloc_age_s,
                 )
 
     def latest(self) -> TelemetrySnapshot:
@@ -107,14 +104,15 @@ class TelemetryTracker:
                 received_at=self._snapshot.received_at,
             )
 
-    def wait_for_first_packet(self, timeout_s: float) -> TelemetrySnapshot:
+    def wait_for_first_packet(self, timeout_s: float, port: int, heard) -> TelemetrySnapshot:
         deadline = time.monotonic() + timeout_s
         with self._condition:
             while self._snapshot.packet is None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
-                        f"No telemetry from drone {self.drone_id} on UDP 5005."
+                        f"No telemetry from drone {self.drone_id} on UDP {port} "
+                        f"(heard drones: {sorted(heard()) or 'none'})."
                     )
                 self._condition.wait(timeout=min(0.5, remaining))
             return self.latest()
@@ -171,6 +169,14 @@ def load_waypoints_from_file(path: str) -> list[tuple[float, float]]:
     return waypoints
 
 
+def join_waypoint_values(argv: list[str]) -> list[str]:
+    """Turn '--waypoint -1,0' into '--waypoint=-1,0' so argparse accepts it."""
+    out, it = [], iter(argv)
+    for arg in it:
+        out.append(f"--waypoint={next(it, '')}" if arg == "--waypoint" else arg)
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Send a simple takeoff -> waypoint -> land mission from the laptop GCS"
@@ -178,13 +184,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--drone-id",
         type=int,
-        default=2,
-        help="Drone ID to command (default: 2).",
+        required=True,
+        help="Flashed ESP32 CONFIG_DRONE_ID.",
+    )
+    parser.add_argument(
+        "--map-frame",
+        action="store_true",
+        help="Treat waypoints as arena coordinates: send the drone's setup.yaml start "
+             "offset. Default: waypoints are relative to the takeoff point.",
     )
     parser.add_argument(
         "--config",
-        default="setup.yaml",
-        help="Path to setup.yaml (default: setup.yaml).",
+        default=str(Path(__file__).with_name("setup.yaml")),
+        help="Path to setup.yaml, used only with --map-frame (default: laptop/setup.yaml).",
     )
     parser.add_argument(
         "--telem-port",
@@ -226,7 +238,19 @@ def parse_args() -> argparse.Namespace:
         "--arrival-radius",
         type=float,
         default=0.25,
-        help="Horizontal distance threshold (meters) to accept a waypoint as reached (default: 0.35).",
+        help="Horizontal distance threshold (meters) to accept a waypoint as reached (default: 0.25).",
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for the first telemetry packet (default: 30).",
+    )
+    parser.add_argument(
+        "--stale-timeout",
+        type=float,
+        default=3.0,
+        help="Land if telemetry is older than this during the mission (default: 3).",
     )
     parser.add_argument(
         "--finish-action",
@@ -244,34 +268,46 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print each incoming telemetry update from the drone.",
     )
-    return parser.parse_args()
+    return parser.parse_args(join_waypoint_values(sys.argv[1:]))
 
 
-def send_command(comms: CommsNode, drone_id: int, command_type: int, name: str) -> None:
-    ok = comms.send_command(drone_id, CommandPacket(command_type))
-    if not ok:
-        raise RuntimeError(f"Failed to send {name}: drone {drone_id} IP is unknown.")
+def send_command(comms: CommsNode, drone_id: int, command_type: int, name: str,
+                 repeat: int = 1) -> None:
+    for _ in range(repeat):
+        if not comms.send_command(drone_id, CommandPacket(command_type)):
+            raise RuntimeError(f"Failed to send {name}: drone {drone_id} IP is unknown.")
+        if repeat > 1:
+            time.sleep(0.1)
     log.info("%s sent to drone %d.", name, drone_id)
+
+
+def send_goto(comms: CommsNode, drone_id: int, goal_x: float, goal_y: float) -> None:
+    if not comms.send_command(drone_id, CommandPacket(CMD_GOTO, goal_x=goal_x, goal_y=goal_y)):
+        raise RuntimeError(f"Failed to send CMD_GOTO: drone {drone_id} IP is unknown.")
 
 
 def wait_for_arrival(
     tracker: TelemetryTracker,
+    resend,
     timeout_s: float,
-    issued_after: float,
+    stale_timeout_s: float,
     goal_x: float,
     goal_y: float,
     arrival_radius_m: float,
-) -> None:
-    deadline = time.monotonic() + timeout_s
-    saw_fresh_telemetry = False
-    saw_non_arrived_state = False
+) -> bool:
+    start = last_sent = time.monotonic()
+    deadline = start + timeout_s
+    saw_moving = False           # drone reported ROTATING/FLYING/STUCK
 
     while time.monotonic() < deadline:
+        now = time.monotonic()
         snapshot = tracker.latest()
         packet = snapshot.packet
+        age = now - snapshot.received_at
+        if age > stale_timeout_s:
+            raise ConnectionError(f"Telemetry is stale ({age:.1f} s).")
 
-        if packet is not None and snapshot.received_at > issued_after:
-            saw_fresh_telemetry = True
+        if snapshot.received_at > start:
             dist_to_goal = math.hypot(packet.ned_x - goal_x, packet.ned_y - goal_y)
 
             log.info(
@@ -283,13 +319,10 @@ def wait_for_arrival(
                 dist_to_goal,
             )
 
-            if packet.nav_state != NAV_ARRIVED:
-                saw_non_arrived_state = True
+            if packet.nav_state in (NAV_ROTATING, NAV_FLYING, NAV_STUCK):
+                saw_moving = True
 
-            # Require post-command telemetry so stale NAV_ARRIVED does not auto-pass.
-            if dist_to_goal <= arrival_radius_m or (
-                packet.nav_state == NAV_ARRIVED and saw_non_arrived_state
-            ):
+            if dist_to_goal <= arrival_radius_m:
                 log.info(
                     "Waypoint reached at (%.2f, %.2f), goal=(%.2f, %.2f), dist=%.2f m",
                     packet.ned_x,
@@ -298,28 +331,26 @@ def wait_for_arrival(
                     goal_y,
                     dist_to_goal,
                 )
-                return
+                return True
+
+            if not saw_moving and now - last_sent >= GOTO_RESEND_S:
+                log.info("Drone not moving yet (nav=%s) — resending CMD_GOTO", packet.nav_state_name)
+                resend()
+                last_sent = now
 
         time.sleep(0.2)
 
-    snapshot = tracker.latest()
-    if snapshot.packet is not None:
-        dist_to_goal = math.hypot(
-            snapshot.packet.ned_x - goal_x,
-            snapshot.packet.ned_y - goal_y,
-        )
-        log.warning(
-            "Waypoint arrival timeout; fresh_telem=%s last nav_state=%s at (%.2f, %.2f), goal=(%.2f, %.2f), dist=%.2f m",
-            "yes" if saw_fresh_telemetry else "no",
-            snapshot.packet.nav_state_name,
-            snapshot.packet.ned_x,
-            snapshot.packet.ned_y,
-            goal_x,
-            goal_y,
-            dist_to_goal,
-        )
-    else:
-        log.warning("Waypoint arrival timeout; no telemetry received.")
+    packet = tracker.latest().packet
+    log.warning(
+        "Waypoint arrival timeout; last nav_state=%s at (%.2f, %.2f), goal=(%.2f, %.2f), dist=%.2f m",
+        packet.nav_state_name,
+        packet.ned_x,
+        packet.ned_y,
+        goal_x,
+        goal_y,
+        math.hypot(packet.ned_x - goal_x, packet.ned_y - goal_y),
+    )
+    return False
 
 
 def main() -> int:
@@ -341,12 +372,23 @@ def main() -> int:
     if not waypoints:
         raise SystemExit("No waypoints supplied. Use --waypoint values or --waypoints-file.")
 
+    config_path: Optional[str] = args.config if args.map_frame else None
+    if config_path and not Path(config_path).exists():
+        raise SystemExit(f"--map-frame needs {config_path}, which was not found.")
+
     tracker = TelemetryTracker(args.drone_id, print_live=args.live_telem)
     comms = CommsNode(
         listen_port=args.telem_port,
         cmd_port=args.cmd_port,
-        config_path=args.config if Path(args.config).exists() else None,
+        config_path=config_path,
     )
+    if config_path is None:
+        # Start offset (0, 0) so waypoints are relative to takeoff; this also
+        # clears any offset a previous setup.yaml run left on the drone.
+        comms.set_nav_tags([], {})
+        log.info("Waypoints are relative to the takeoff point (start offset 0, 0).")
+    else:
+        log.info("Waypoints are in the arena frame (start offset from %s).", config_path)
     comms.on_telemetry(tracker.callback)
 
     def handle_interrupt(signum: int, frame: object) -> None:
@@ -354,10 +396,11 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, handle_interrupt)
 
+    start_sent = land_sent = aborted = False
     comms.start()
     try:
         log.info("Waiting for telemetry from drone %d...", args.drone_id)
-        tracker.wait_for_first_packet(30.0)
+        tracker.wait_for_first_packet(args.connect_timeout, args.telem_port, comms.known_drones)
         log.info("Telemetry link established.")
 
         if args.confirm:
@@ -370,9 +413,11 @@ def main() -> int:
 
         log.info("Sending CMD_START (arm + takeoff)")
         send_command(comms, args.drone_id, CMD_START, "CMD_START")
+        start_sent = True
         if args.takeoff_wait > 0.0:
             time.sleep(args.takeoff_wait)
 
+        missed = 0
         for index, (goal_x, goal_y) in enumerate(waypoints, start=1):
             log.info(
                 "Sending waypoint %d/%d to (%.2f, %.2f)",
@@ -381,43 +426,52 @@ def main() -> int:
                 goal_x,
                 goal_y,
             )
-            issued_after = time.monotonic()
-            sent_ok = comms.send_command(
-                args.drone_id,
-                CommandPacket(CMD_GOTO, goal_x=goal_x, goal_y=goal_y),
-            )
-            if not sent_ok:
-                raise RuntimeError(
-                    f"Failed to send CMD_GOTO: drone {args.drone_id} IP is unknown."
-                )
 
-            wait_for_arrival(
+            def resend(gx: float = goal_x, gy: float = goal_y) -> None:
+                send_goto(comms, args.drone_id, gx, gy)
+
+            resend()
+            if not wait_for_arrival(
                 tracker,
+                resend,
                 timeout_s=args.arrival_timeout,
-                issued_after=issued_after,
+                stale_timeout_s=args.stale_timeout,
                 goal_x=goal_x,
                 goal_y=goal_y,
                 arrival_radius_m=args.arrival_radius,
-            )
+            ):
+                missed += 1
+                send_command(comms, args.drone_id, CMD_HOLD, "CMD_HOLD")   # stop before next leg
             time.sleep(0.5)
 
         if args.finish_action == "land":
             log.info("Sending CMD_LAND")
-            send_command(comms, args.drone_id, CMD_LAND, "CMD_LAND")
+            send_command(comms, args.drone_id, CMD_LAND, "CMD_LAND", repeat=3)
+            land_sent = True
         else:
             log.info("Sending CMD_HOLD")
             send_command(comms, args.drone_id, CMD_HOLD, "CMD_HOLD")
+
+        if missed:
+            log.warning("%d of %d waypoints not reached.", missed, len(waypoints))
+            return 1
         return 0
     except KeyboardInterrupt:
-        log.info("Mission interrupted. Sending CMD_LAND.")
-        try:
-            send_command(comms, args.drone_id, CMD_LAND, "CMD_LAND")
-        except Exception:
-            pass
+        aborted = True
+        log.warning("Mission interrupted.")
         return 130
+    except Exception as exc:
+        aborted = True
+        log.error("Mission aborted: %s", exc)
+        return 1
     finally:
+        if aborted and start_sent and not land_sent:
+            try:
+                send_command(comms, args.drone_id, CMD_LAND, "fallback CMD_LAND", repeat=3)
+            except Exception as exc:
+                log.error("Could not send fallback LAND: %s", exc)
         comms.stop()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

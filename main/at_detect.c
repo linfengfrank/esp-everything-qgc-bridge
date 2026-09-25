@@ -25,11 +25,8 @@
 
 #include "at_detect.h"
 #include "odom.h"
-#include "mavlink_task.h"
 
 #include "freertos/semphr.h"
-
-#include <math.h>
 
 static at_detect_pose_t  s_pose;
 static SemaphoreHandle_t s_pose_mutex;
@@ -51,46 +48,6 @@ at_live_dets_t at_detect_get_live(void)
     at_live_dets_t copy = s_live;
     xSemaphoreGive(s_live_mutex);
     return copy;
-}
-/* Camera is pitched 45° nose-down, 2 cm forward of drone centre.
- *
- * apriltag_pose camera frame (OpenCV): X=right, Y=down, Z=forward
- * Body frame:                          X=fwd,   Y=rgt,  Z=down
- *
- * The camera image is vertically flipped relative to the standard
- * OpenCV convention (the sensor is mounted with Y inverted), so ty
- * from estimate_tag_pose() has the opposite sign to the geometric
- * derivation.  The corrected body-frame transform is therefore:
- *
- *   body_x =  cos45·tz + sin45·ty   (forward)  ← note + not −
- *   body_y =  tx                     (right)
- *   body_z =  sin45·tz − cos45·ty   (down — unused)
- *
- * Mount offset: camera is CAM_FWD_OFFSET_M ahead of CoM. */
-#define CAM_PITCH_DEG       45.0f
-#define CAM_FWD_OFFSET_M    0.02f
-
-void camera_to_ned(float tx, float ty, float tz,
-                           float heading,
-                           float *out_dn,      /* NED north offset to tag (m) */
-                           float *out_de,      /* NED east  offset to tag (m) */
-                           float *out_hdist)   /* horizontal distance to tag  */
-{
-    const float pitch = CAM_PITCH_DEG * (float)M_PI / 180.0f;
-    const float cp    = cosf(pitch);   /* cos 45° = 0.7071 */
-    const float sp    = sinf(pitch);   /* sin 45° = 0.7071 */
-
-    /* Camera frame → body frame (ty sign inverted due to flipped image) */
-    float body_x = cp * tz + sp * ty + CAM_FWD_OFFSET_M;   /* forward */
-    float body_y = tx;                                        /* right   */
-    /* float body_z = sp * tz - cp * ty; */   /* down — not needed yet */
-
-    /* Horizontal distance from drone centre to tag (frame-invariant) */
-    *out_hdist = sqrtf(body_x * body_x + body_y * body_y);
-
-    /* Body frame → NED world frame */
-    *out_dn = body_x * cosf(heading) - body_y * sinf(heading);
-    *out_de = body_x * sinf(heading) + body_y * cosf(heading);
 }
 // support IDF 5.x
 #ifndef portTICK_RATE_MS
@@ -197,8 +154,6 @@ static esp_err_t init_camera(void)
  * at once and the stream task is not left with a single buffer. */
 #define AT_FRAME_COPY_BYTES (320 * 240)
 
-static volatile bool  s_land_requested = false;
-static volatile int   s_last_tag_id = -1;
 static volatile int8_t s_my_tag_id  = -1;   /* latched: set once, never overwritten */
 
 static int8_t            s_known_tags[AT_MAX_KNOWN_TAGS];
@@ -219,8 +174,6 @@ static bool tag_is_known(int id)
 
 void at_detect_init(void)
 {
-    s_land_requested = false;
-    s_last_tag_id    = -1;
     s_my_tag_id      = -1;
     s_known_count    = 0;
     memset(&s_pose, 0, sizeof(s_pose));
@@ -231,30 +184,6 @@ void at_detect_init(void)
     configASSERT(s_pose_mutex != NULL);
     configASSERT(s_known_mutex != NULL);
     configASSERT(s_live_mutex != NULL);
-}
-
-bool at_detect_land_requested(void)
-{
-  return s_land_requested;
-}
-
-void at_detect_clear_land_request(void)
-{
-  s_land_requested = false;
-}
-
-void at_detect_reset_latch(void)
-{
-    s_my_tag_id      = -1;
-    s_land_requested = false;
-    xSemaphoreTake(s_pose_mutex, portMAX_DELAY);
-    s_pose.valid = false;
-    xSemaphoreGive(s_pose_mutex);
-}
-
-int at_detect_last_id(void)
-{
-  return s_last_tag_id;
 }
 
 int8_t at_detect_my_tag_id(void)
@@ -302,8 +231,11 @@ int avg_img(image_u8_t* im) {
 void at_detect_task(void* pvParams)
 {
 #if ESP_CAMERA_SUPPORTED
+    /* A task must not return (ESP-IDF aborts): end only this task. */
     if(ESP_OK != init_camera()) {
-        return;
+        ESP_LOGE(TAG, "Camera init failed — AprilTag detection and camera "
+                      "stream disabled; flight is unaffected");
+        vTaskDelete(NULL);
     }
 
     /* NULL: always detect on the camera buffer (the preview just slows). */
@@ -413,42 +345,10 @@ void at_detect_task(void* pvParams)
 
           if (det->hamming > 1 || det->decision_margin <= 55.0) continue;
 
-          /* Pose estimation info — shared by both nav and landing paths */
-          apriltag_detection_info_t info = {
-            .det     = det,
-            .tagsize = TAG_SIZE,
-            .fx = F_X, .fy = F_Y,
-            .cx = C_X, .cy = C_Y,
-          };
+          /* Nav tags: landmarks only, never claimed. */
+          if (odom_find_nav_tag(det->id, NULL)) continue;
 
-          /* ---- Navigation tag → odometry correction (no landing) ---- */
-          nav_tag_t nav;
-          if (odom_find_nav_tag(det->id, &nav)) {
-              apriltag_pose_t pose;
-              double err = estimate_tag_pose(&info, &pose);
-              if (err < 0.5) {
-                  /* cam_in_tag = -R^T * t  (camera position in tag frame) */
-                  float tx = (float)MATD_EL(pose.t, 0, 0);
-                  float ty = (float)MATD_EL(pose.t, 1, 0);
-                  float tz = (float)MATD_EL(pose.t, 2, 0);
-                  float r00 = (float)MATD_EL(pose.R, 0, 0);
-                  float r10 = (float)MATD_EL(pose.R, 1, 0);
-                  float r20 = (float)MATD_EL(pose.R, 2, 0);
-                  float r01 = (float)MATD_EL(pose.R, 0, 1);
-                  float r11 = (float)MATD_EL(pose.R, 1, 1);
-                  float r21 = (float)MATD_EL(pose.R, 2, 1);
-                  float cam_tag_x = -(r00 * tx + r10 * ty + r20 * tz);
-                  float cam_tag_y = -(r01 * tx + r11 * ty + r21 * tz);
-                  odom_on_tag_seen(det->id, cam_tag_x, cam_tag_y);
-              } else {
-                  ESP_LOGW(TAG, "Nav tag %d pose error too high (%.3f)", det->id, err);
-              }
-              matd_destroy(pose.R);
-              matd_destroy(pose.t);
-              continue;   /* nav tags never trigger landing */
-          }
-
-          /* ---- Landing tag — existing behaviour ---- */
+          /* ---- Other tag → claim + pose, telemetry only ---- */
 
           /* Skip tags the fleet already found (unless it's our own) */
           if (s_my_tag_id >= 0 && det->id != s_my_tag_id) continue;
@@ -458,31 +358,29 @@ void at_detect_task(void* pvParams)
           }
 
           ESP_LOGI(TAG, "Apriltag found! ID=%d, DM=%f, hamming=%d", det->id, det->decision_margin, det->hamming);
-          s_last_tag_id = det->id;
 
+          apriltag_detection_info_t info = {
+            .det     = det,
+            .tagsize = TAG_SIZE,
+            .fx = F_X, .fy = F_Y,
+            .cx = C_X, .cy = C_Y,
+          };
           apriltag_pose_t pose;
           double err = estimate_tag_pose(&info, &pose);
 
           /* Only trust estimates with low reprojection error */
           if (err < 0.5) {
-            drone_state_t det_drone = mavlink_get_state();
             xSemaphoreTake(s_pose_mutex, portMAX_DELAY);
             s_pose.tx           = (float)MATD_EL(pose.t, 0, 0);
             s_pose.ty           = (float)MATD_EL(pose.t, 1, 0);
             s_pose.tz           = (float)MATD_EL(pose.t, 2, 0);
             s_pose.valid        = true;
-            s_pose.tag_id       = det->id;
-            s_pose.drone_x      = det_drone.x;
-            s_pose.drone_y      = det_drone.y;
-            s_pose.drone_heading = det_drone.heading;
-            s_pose.detect_ms    = (uint32_t)(esp_timer_get_time() / 1000);
             xSemaphoreGive(s_pose_mutex);
 
-            if (!s_land_requested) {
+            if (s_my_tag_id < 0) {
               s_my_tag_id = (int8_t)det->id;
-              s_land_requested = true;
-              ESP_LOGW(TAG, "Land request raised (id=%d err=%.3f "
-                  "t=[%.2f,%.2f,%.2f])",
+              ESP_LOGW(TAG, "Tag %d claimed (err=%.3f t=[%.2f,%.2f,%.2f]) — "
+                  "reported in telemetry, no flight action",
                   det->id, err,
                   s_pose.tx, s_pose.ty, s_pose.tz);
             }
@@ -518,6 +416,6 @@ void at_detect_task(void* pvParams)
     }
 #else
     ESP_LOGE(TAG, "Camera support is not available for this chip");
-    return;
+    vTaskDelete(NULL);
 #endif
 }

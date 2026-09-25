@@ -1,6 +1,7 @@
 # Example waypoint file for simple_waypoint_mission.py
 # Each line: x,y
-# NED frame: x=north, y=east
+# NED, relative to the takeoff point: x=north, y=east (m)
+# (--map-frame makes them arena coordinates from laptop/setup.yaml)
 0.0,0.0
 0.8,0.0
 0.8,0.8
