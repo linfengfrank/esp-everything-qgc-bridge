@@ -3,13 +3,13 @@
 ESP32-S3 companion-computer firmware for CDE1302.
 It consists of ESP32 firmware in `main/` and laptop-side Python scripts in `laptop/`.
 
-Note that the example drone ID in this README is 22. You need to change it to your drone's ID when running the scripts.
+Note that the example drone ID in this README is 22 (it's indicated as [drone ID] in some places). You need to change it to your drone's ID when running the scripts.
 
 ## 1. Setup ESP32 (Optional)
 
-You can skip this if you only want to run the laptop scripts. The ESP32 firmware is already built and flashed into the drone's ESP32-S3.
+You can skip this if you only want to run the laptop scripts. The ESP32 firmware has already been built and flashed onto the drone's ESP32-S3.
 
-In this step, you need to connect to the internet to be able to build, and close the QGroundControl app if it is running. The ESP32-S3 must be connected to the laptop via USB.
+In this step, you need an internet connection to build and close the QGroundControl app if it is running. The ESP32-S3 must be connected to the laptop via USB.
 
 Everything this firmware needs is committed in-tree (MAVLink `c_library_v2`,
 esp-apriltag, the VL53L5CX driver and `managed_components/`). The only external
@@ -39,8 +39,6 @@ generated header really is that drone, flashes, then restores `sdkconfig`:
 ./flash_drone.sh 22 /dev/tty.usbmodem2101  # non-interactive
 ```
 
-Note that this requires internet to build this.
-
 It finds ESP-IDF automatically (`$IDF_PATH`, `./esp-idf`, `../esp-idf`,
 `~/esp/esp-idf`, `~/esp-idf`), sourcing `export.sh` only if needed.
 
@@ -62,7 +60,7 @@ The WiFi router must use gateway `192.168.1.1` with netmask
 
 ## 2. Setup (Laptop)
 
-You can choose one of these following two options to install the laptop-side Python scripts and dependencies:
+You can choose one of the following two options to install the laptop-side Python scripts and dependencies:
 
 ### Pip install (Python 3.10+)
 
@@ -79,12 +77,12 @@ works on a machine whose Python is too old or shared with other projects.
 
 `laptop/environment.yml` creates an environment named `cde1302-laptop` with
 Python 3.12 and the packages from `laptop/requirements.txt`. Every package
-installs prebuilt on 64-bit Windows, Linux with glibc 2.27+ (Ubuntu 18.04+),
+installs prebuilt binaries on 64-bit Windows, Linux with glibc 2.27+ (Ubuntu 18.04+),
 and macOS 13+ (14+ on an Intel Mac); older systems fall back to compiling
 OpenCV or SciPy from source.
 
 1. Install conda once per machine. An existing Anaconda or Miniconda works;
-   on a new machine install Miniforge (on Windows, see [Windows](#windows-havent-tested-yet)):
+   on a new machine, install Miniforge (on Windows, see [Windows](#windows-havent-tested-yet)):
 
    ```bash
    curl -LO "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
@@ -94,7 +92,7 @@ OpenCV or SciPy from source.
    Then open a new terminal. If `conda activate` later says to run
    `conda init`, run `conda init zsh` (or `bash`) and open a new terminal.
 
-2. Create the environment, once, from the repo root:
+2. Create the environment once from the repo root:
 
    ```bash
    conda env create -f laptop/environment.yml
@@ -151,7 +149,7 @@ Follow the conda steps above, with these changes:
 
 ### Laptop IP address
 
-The drones send MAVLink, telemetry and ToF debug data to
+The drones send MAVLink, telemetry, and ToF debug data to
 `192.168.1.(100 + drone ID)` (set when flashing), so the QGroundControl or
 mission laptop must hold that address on the drone Wi-Fi. Camera video follows
 the source IP of the latest `camera_stream.py` or `tag_stream.py` keepalive and
@@ -161,7 +159,7 @@ AprilTag debug stream is also copied to that viewer when `tag_stream.py` uses
 
 ## 3. ESP32 camera preview
 
-View a drone's camera over WiFi (drone IP = `192.168.1.(200 + drone ID)`):
+View a drone's camera over WiFi (drone IP = `192.168.1.(200 + drone ID)`; here the example drone ID is 22, so the drone IP becomes 192.168.1.222):
 
 ```bash
 python3 laptop/camera_stream.py --esp-ip 192.168.1.222 [--fps 10] [--quality 60]
@@ -208,11 +206,11 @@ Full procedure: [laptop/TEST_GUIDE.md](laptop/TEST_GUIDE.md).
 
 ```bash
 python3 laptop/simple_waypoint_mission.py \
-  --waypoints-file waypoints/waypoints_example.txt \
-  --drone-id [DRONE_ID] --confirm
+  --waypoints-file waypoints/waypoints_example.txt --confirm \
+  --drone-id [DRONE_ID]
 ```
 
-`--confirm` asks for `MISSION-[drone ID]`; without it the drone takes off as
+`--confirm` asks for `MISSION-[drone ID]`; without it, the drone takes off as
 soon as telemetry arrives. Waypoints are `x,y` metres (x = north, y = east) from
 PX4's local origin, plus the drone's start offset in `laptop/setup.yaml` if listed.
 
@@ -220,13 +218,14 @@ Full procedure: [waypoints/WAYPOINT_FLIGHT_TEST_GUIDE.md](waypoints/WAYPOINT_FLI
 
 ## 6. Fly from a CSV trajectory
 
-This is 2x1 ellipse minimum-snap trajectory. Put the drone at the tip of the major axis, facing outward. The take off placement can be seen in `trajectory/ellipse_start_placement.png`.
+This is a 2x1 ellipse minimum-snap trajectory. Put the drone at the tip of the major axis, facing outward. The takeoff placement can be seen in `trajectory/ellipse_start_placement.png`.
 
 ```bash
-python3 laptop/send_trajectory.py --takeoff --takeoff-wait 12 --trajectory trajectory/ellipse_min_snap_traj.csv --drone-id [DRONE_ID] --confirm
+python3 laptop/send_trajectory.py --takeoff --takeoff-wait 12 \
+  --trajectory trajectory/ellipse_min_snap_traj.csv --confirm \
+  --drone-id [DRONE_ID]
 ```
 
 `--confirm` asks for `TRAJ-[drone ID]` before anything is sent.
 
-See `trajectory/README.md` for the included circle and compact minimum-snap
-ellipse, how to regenerate their CSV files, and the space each path needs.
+See `trajectory/README.md` for the included circle and compact minimum-snap ellipse, how to regenerate their CSV files, and the space each path needs.
