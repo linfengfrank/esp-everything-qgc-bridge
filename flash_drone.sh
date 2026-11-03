@@ -81,6 +81,11 @@ then follow tools/idf-pin.env (checkout the pin, ./install.sh esp32s3)."
 fi
 echo "using $(command -v idf.py) -- $(idf.py --version 2>/dev/null)"
 
+# Stay offline: dependencies.lock + managed_components already pin the camera
+# libs, so skip the registry "newer version?" lookup. On the drone router
+# (no internet) that lookup hangs ~30 s per build. Set to 1 to re-enable.
+export IDF_COMPONENT_CHECK_NEW_VERSION="${IDF_COMPONENT_CHECK_NEW_VERSION:-0}"
+
 # Warn, but never refuse, when the found ESP-IDF is not the pinned one.
 PIN="$PROJECT_DIR/tools/idf-pin.env"
 if [ -f "$PIN" ] && [ -n "${IDF_PATH:-}" ]; then
